@@ -1,0 +1,57 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Lora:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 265 4% 12.9%;
+    --primary: 103 18% 73%;
+    --accent: 103 18% 35%;
+    --border: 103 18% 90%;
+    --radius: 0.75rem;
+  }
+
+  body {
+    @apply bg-canvas text-text-primary font-sans antialiased;
+  }
+
+  h1, h2, h3, h4 {
+    @apply font-serif;
+  }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-primary-light/20;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-primary-mid/50 rounded-full hover:bg-primary-mid;
+}
+
+/* Table Styles */
+table {
+  @apply border-separate border-spacing-0;
+}
+
+th {
+  @apply text-left font-bold text-text-muted uppercase tracking-widest;
+}
+
+/* Dialog Overlay Animation */
+[data-state='open'] .DialogOverlay {
+  animation: overlayShow 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes overlayShow {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
