@@ -1,0 +1,168 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MigrationStatus {
+  DRAFT
+  READY_FOR_REVIEW
+  REVIEWED
+  EXPORTED
+  ARCHIVED
+}
+
+model Migration {
+  id             String          @id @default(uuid())
+  shareCode      String          @unique @default(uuid())
+  name           String
+  status         MigrationStatus @default(DRAFT)
+  revision       Int             @default(1)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  lastActivityAt DateTime        @default(now())
+
+  groups         ProductGroup[]
+  locations      Location[]
+  units          Unit[]
+  products       Product[]
+  batches        Batch[]
+  openingStocks  OpeningStock[]
+}
+
+model ProductGroup {
+  id          String    @id @default(uuid())
+  migrationId String
+  name        String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  version     Int       @default(1)
+
+  migration   Migration @relation(fields: [migrationId], references: [id])
+  products    Product[]
+
+  @@unique([migrationId, name])
+}
+
+model Location {
+  id          String         @id @default(uuid())
+  migrationId String
+  name        String
+  description String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  version     Int            @default(1)
+
+  migration   Migration      @relation(fields: [migrationId], references: [id])
+  openingStocks OpeningStock[]
+
+  @@unique([migrationId, name])
+}
+
+model Unit {
+  id          String        @id @default(uuid())
+  migrationId String
+  name        String
+  symbol      String?
+  description String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  version     Int           @default(1)
+
+  migration   Migration     @relation(fields: [migrationId], references: [id])
+  productUnits ProductUnit[]
+
+  @@unique([migrationId, name])
+}
+
+model Product {
+  id          String        @id @default(uuid())
+  migrationId String
+  sku         String
+  name        String
+  genericName String?
+  brand       String?
+  groupId     String?
+  description String?
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  version     Int           @default(1)
+
+  migration   Migration     @relation(fields: [migrationId], references: [id])
+  group       ProductGroup? @relation(fields: [groupId], references: [id])
+  productUnits ProductUnit[]
+  batches     Batch[]
+
+  @@unique([migrationId, sku])
+}
+
+model ProductUnit {
+  id               String   @id @default(uuid())
+  productId        String
+  unitId           String
+  conversionToBase Float
+  isBaseUnit       Boolean  @default(false)
+  sellPrice        Float?
+  purchasePrice    Float?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  version          Int      @default(1)
+
+  product          Product  @relation(fields: [productId], references: [id])
+  unit             Unit     @relation(fields: [unitId], references: [id])
+
+  @@unique([productId, unitId])
+}
+
+model Batch {
+  id                String         @id @default(uuid())
+  migrationId       String
+  productId         String
+  batchNumber       String
+  expiryDate        DateTime
+  manufacturingDate DateTime?
+  receivedDate      DateTime?
+  supplierReference String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  version           Int            @default(1)
+
+  migration         Migration      @relation(fields: [migrationId], references: [id])
+  product           Product        @relation(fields: [productId], references: [id])
+  openingStocks     OpeningStock[]
+
+  @@unique([migrationId, productId, batchNumber])
+}
+
+model OpeningStock {
+  id            String   @id @default(uuid())
+  migrationId   String
+  productId     String
+  batchId       String
+  locationId    String
+  baseQuantity  Float
+  unitBreakdown Json     // e.g., [{ unitId, quantity }]
+  unitCost      Float    @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  version       Int      @default(1)
+
+  migration     Migration @relation(fields: [migrationId], references: [id])
+  batch         Batch     @relation(fields: [batchId], references: [id])
+  location      Location  @relation(fields: [locationId], references: [id])
+
+  @@unique([migrationId, batchId, locationId])
+}
+
+model ProcessedOperation {
+  operationId String   @id
+  migrationId String
+  result      Json
+  createdAt   DateTime @default(now())
+
+  migration Migration @relation(fields: [migrationId], references: [id])
+}
