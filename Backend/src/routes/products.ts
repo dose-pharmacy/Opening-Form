@@ -5,7 +5,7 @@ const router = Router({ mergeParams: true });
 
 router.get('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     const { page = 1, limit = 50, search } = req.query;
 
     const skip = (Number(page) - 1) * Number(limit);
@@ -39,7 +39,7 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     let { sku, name, genericName, brand, groupId, description, isActive } = req.body;
     
     if (!sku || typeof sku !== 'string') {
@@ -83,7 +83,7 @@ router.post('/', async (req, res) => {
 
 router.get('/:id', async (req, res) => {
     try {
-        const { migrationId, id } = req.params;
+        const { migrationId, id } = (req.params as any);
         const product = await prisma.product.findUnique({
             where: { id, migrationId },
             include: { group: true, productUnits: { include: { unit: true } } }
@@ -97,7 +97,7 @@ router.get('/:id', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
     const { sku, name, genericName, brand, groupId, description, isActive, version } = req.body;
 
     if (!version) {
@@ -150,7 +150,7 @@ router.patch('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
 
     const productUnitsCount = await prisma.productUnit.count({ where: { productId: id } });
     const batchesCount = await prisma.batch.count({ where: { productId: id } });

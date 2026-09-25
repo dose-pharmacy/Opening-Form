@@ -1,4 +1,4 @@
-import { openDB, DBSchema, IDBPDatabase } from 'idb';
+import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 
 export interface MigrationDB extends DBSchema {
   migrations: {
@@ -47,11 +47,13 @@ export interface MigrationDB extends DBSchema {
       migrationId: string;
       entityType: string;
       entityId: string;
-      operationType: 'CREATE' | 'UPDATE' | 'DELETE';
+      operationType: 'CREATE' | 'UPDATE' | 'UPSERT' | 'DELETE';
       payload: any;
       baseVersion?: number;
       createdAt: number;
-      status: 'PENDING' | 'SYNCING' | 'FAILED' | 'CONFLICT';
+      /** Monotonic ordinal so parents are pushed before their children. */
+      sequence?: number;
+      status: 'PENDING' | 'SYNCING' | 'FAILED' | 'CONFLICT' | 'ERROR';
       retryCount: number;
       lastError?: string;
     };

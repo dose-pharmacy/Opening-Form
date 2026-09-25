@@ -3,7 +3,7 @@ node_modules
 .env.local
 .env.*.local
 build
-.dist
+/dist
 coverage
 *.log
 .DS_Store

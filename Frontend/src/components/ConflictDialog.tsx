@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from 'react';
-import { AlertCircle, Check, X, RefreshCw } from 'lucide-react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { AlertCircle, Check, Cloud, RefreshCw, XCircle } from 'lucide-react';
 import { getDB } from '../local-store/db';
-import { OperationQueue } from '../sync/queue';
+import { OperationQueue, type ConflictRecord, type SyncOperation } from '../sync/queue';
 import { SyncManager } from '../sync/syncManager';
 
 interface ConflictDialogProps {
@@ -9,106 +9,175 @@ interface ConflictDialogProps {
   onClose: () => void;
 }
 
+interface ResolvedIssue {
+  op: SyncOperation;
+  details?: ConflictRecord;
+}
+
 export const ConflictDialog: React.FC<ConflictDialogProps> = ({ migrationId, onClose }) => {
-  const [conflicts, setConflicts] = useState<any[]>([]);
+  const [issues, setIssues] = useState<ResolvedIssue[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    loadConflicts();
-  }, [migrationId]);
-
-  const loadConflicts = async () => {
+  const loadIssues = useCallback(async () => {
     setLoading(true);
     const db = await getDB();
-    const allOps = await db.getAllFromIndex('operations', 'by-migration', migrationId);
-    const conflictOps = allOps.filter(op => op.status === 'CONFLICT');
-    
-    const detailedConflicts = await Promise.all(
-        conflictOps.map(async op => {
-            const conflictDetails = await db.get('conflicts', op.operationId);
-            return { op, details: conflictDetails };
-        })
+    const allOps = (await db.getAllFromIndex('operations', 'by-migration', migrationId)) as
+      | SyncOperation[]
+      | undefined;
+    const unresolved = (allOps ?? []).filter(
+      (op) => op.status === 'CONFLICT' || op.status === 'ERROR'
     );
-    setConflicts(detailedConflicts);
+
+    const detailed = await Promise.all(
+      unresolved.map(async (op) => ({ op, details: await OperationQueue.getConflict(op.operationId) }))
+    );
+
+    setIssues(detailed);
     setLoading(false);
-    
-    if (detailedConflicts.length === 0) {
-        onClose();
-    }
-  };
+    if (detailed.length === 0) onClose();
+  }, [migrationId, onClose]);
 
-  const handleKeepServer = async (op: any, serverVersion: number) => {
-    // Drop the local operation, adopt server version
+  useEffect(() => {
+    loadIssues();
+  }, [loadIssues]);
+
+  const handleKeepServer = async ({ op }: ResolvedIssue) => {
+    await OperationQueue.removeOperation(op.operationId);
     const db = await getDB();
-    await db.delete('operations', op.operationId);
     await db.delete('conflicts', op.operationId);
-    // Let next sync/fetch pull the server data, or we just rely on full reconcile
-    await SyncManager.updateLocalVersion(migrationId, op.entityId, serverVersion); 
-    loadConflicts();
+    // The server copy stays authoritative; the next pull refreshes the mirror.
+    SyncManager.pullChanges(migrationId).finally(loadIssues);
   };
 
-  const handleKeepLocal = async (op: any, serverVersion: number) => {
-    // Re-enqueue the operation but with the updated baseVersion
-    const db = await getDB();
-    const operation = await db.get('operations', op.operationId);
-    if (operation) {
-        operation.baseVersion = serverVersion;
-        operation.status = 'PENDING';
-        operation.retryCount = 0;
-        await db.put('operations', operation);
-        await db.delete('conflicts', op.operationId);
-    }
-    SyncManager.triggerSync(migrationId);
-    loadConflicts();
+  const handleKeepLocal = async ({ op, details }: ResolvedIssue) => {
+    await OperationQueue.requeue(op.operationId, details?.currentVersion ?? undefined);
+    SyncManager.triggerSync(migrationId).finally(loadIssues);
+  };
+
+  const handleRetry = async ({ op }: ResolvedIssue) => {
+    await OperationQueue.requeue(op.operationId);
+    SyncManager.triggerSync(migrationId).finally(loadIssues);
   };
 
   if (loading) return null;
 
+  const label = (op: SyncOperation) => op.entityType.replace(/_/g, ' ').toLowerCase();
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
-      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
+      <div className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
         <div className="flex items-center gap-3 border-b border-primary-mid/10 bg-primary-light/30 px-6 py-4">
           <AlertCircle className="h-5 w-5 text-red-500" />
-          <h2 className="text-lg font-semibold text-text-primary">Resolve Conflicts</h2>
+          <h2 className="text-lg font-semibold text-text-primary">
+            {title(issues)}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="ml-auto rounded-lg p-1.5 text-text-muted hover:bg-black/5"
+            aria-label="Close"
+          >
+            <XCircle className="h-4 w-4" />
+          </button>
         </div>
-        
-        <div className="overflow-y-auto p-6 flex flex-col gap-6">
-            {conflicts.map(({ op, details }) => (
-                <div key={op.operationId} className="border border-red-200 bg-red-50/30 rounded-lg p-4 flex flex-col gap-4">
-                    <div className="flex items-center justify-between">
-                        <span className="font-bold text-sm text-text-primary uppercase tracking-wide">{op.entityType}</span>
-                        <span className="text-xs text-text-muted">Entity ID: {op.entityId.slice(0, 8)}...</span>
-                    </div>
-                    
-                    <div className="grid grid-cols-2 gap-4 text-sm">
-                        <div className="bg-white p-3 rounded border shadow-sm">
-                            <h4 className="font-semibold text-text-primary mb-2">Your Change</h4>
-                            <pre className="text-xs text-text-secondary overflow-auto max-h-40">{JSON.stringify(op.payload, null, 2)}</pre>
-                            <div className="mt-2 text-xs text-text-muted">Base Version: {op.baseVersion || 1}</div>
-                        </div>
-                        <div className="bg-white p-3 rounded border shadow-sm border-blue-200">
-                            <h4 className="font-semibold text-text-primary mb-2 flex items-center gap-2">
-                                <Cloud className="h-3.5 w-3.5 text-blue-500" /> Server Version
-                            </h4>
-                            <pre className="text-xs text-text-secondary overflow-auto max-h-40">{JSON.stringify(details?.serverData || {}, null, 2)}</pre>
-                            <div className="mt-2 text-xs text-text-muted">Current Version: {details?.currentVersion}</div>
-                        </div>
-                    </div>
 
-                    <div className="flex justify-end gap-3 mt-2">
-                        <button onClick={() => handleKeepServer(op, details?.currentVersion)} className="px-4 py-2 text-sm bg-white border hover:bg-gray-50 rounded-lg font-medium transition-colors">
-                            Keep Server Version
-                        </button>
-                        <button onClick={() => handleKeepLocal(op, details?.currentVersion)} className="px-4 py-2 text-sm bg-accent hover:bg-accent-soft text-white rounded-lg font-medium shadow-sm transition-colors flex items-center gap-2">
-                            <Check className="h-4 w-4" /> Keep My Version
-                        </button>
-                    </div>
+        <div className="flex-1 overflow-y-auto p-6">
+          {issues.map(({ op, details }) => {
+            const isConflict = op.status === 'CONFLICT';
+            const serverData = details?.serverData;
+            const hasServerCopy = Boolean(serverData && Object.keys(serverData).length > 0);
+
+            return (
+              <div
+                key={op.operationId}
+                className="mb-6 rounded-lg border border-red-200 bg-red-50/30 p-4 last:mb-0"
+              >
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm font-bold uppercase tracking-wide text-text-primary">
+                    {label(op)} · {op.entityId}
+                  </span>
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                      isConflict ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'
+                    }`}
+                  >
+                    {isConflict ? 'Conflicting change' : 'Rejected by server'}
+                  </span>
                 </div>
-            ))}
+
+                {!isConflict && (
+                  <p className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                    {details?.error || op.lastError || 'The server could not apply this change.'}
+                  </p>
+                )}
+
+                <div className="grid gap-4 text-sm sm:grid-cols-2">
+                  <div className="rounded border bg-white p-3 shadow-sm">
+                    <h4 className="mb-2 font-semibold text-text-primary">Your change</h4>
+                    <pre className="max-h-40 overflow-auto text-xs text-text-secondary">
+                      {JSON.stringify(op.payload, null, 2)}
+                    </pre>
+                    <div className="mt-2 text-xs text-text-muted">
+                      Base version: {op.baseVersion ?? '—'}
+                    </div>
+                  </div>
+                  <div className="rounded border border-blue-200 bg-white p-3 shadow-sm">
+                    <h4 className="mb-2 flex items-center gap-2 font-semibold text-text-primary">
+                      <Cloud className="h-3.5 w-3.5 text-blue-500" /> Server version
+                    </h4>
+                    {hasServerCopy ? (
+                      <>
+                        <pre className="max-h-40 overflow-auto text-xs text-text-secondary">
+                          {JSON.stringify(serverData, null, 2)}
+                        </pre>
+                        <div className="mt-2 text-xs text-text-muted">
+                          Current version: {details?.currentVersion ?? '—'}
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-xs text-text-muted">
+                        No record on the server for this change.
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap justify-end gap-3">
+                  {isConflict ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleKeepServer({ op, details })}
+                        className="rounded-lg border bg-white px-4 py-2 text-sm font-medium transition-colors hover:bg-gray-50"
+                      >
+                        Keep server version
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleKeepLocal({ op, details })}
+                        className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-accent-soft"
+                      >
+                        <Check className="h-4 w-4" /> Keep my version
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleRetry({ op, details })}
+                      className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-accent-soft"
+                    >
+                      <RefreshCw className="h-4 w-4" /> Retry change
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
         <div className="flex justify-end border-t border-primary-mid/10 bg-gray-50 p-4">
           <button
+            type="button"
             onClick={onClose}
             className="rounded-lg px-4 py-2 text-sm font-medium text-text-secondary hover:bg-black/5"
           >
@@ -120,7 +189,12 @@ export const ConflictDialog: React.FC<ConflictDialogProps> = ({ migrationId, onC
   );
 };
 
-// Helper for icon
-const Cloud = ({ className }: { className?: string }) => (
-    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M17.5 19a1 1 0 0 0 1-1 4.5 4.5 0 0 0-1-8.7A5 5 0 0 0 8.5 5.5a1 1 0 0 0-1 1 5 5 0 1 0-2.5 9.4 1 1 0 0 0 .5 1.7 6.5 6.5 0 1 0 12-7.8"/></svg>
-)
+const title = (issues: ResolvedIssue[]): string => {
+  const conflicts = issues.filter((i) => i.op.status === 'CONFLICT').length;
+  const errors = issues.length - conflicts;
+  if (conflicts && errors) return `${conflicts} conflict(s) and ${errors} rejected change(s)`;
+  if (conflicts) return `${conflicts} conflict(s) to resolve`;
+  return `${errors} change(s) rejected by the server`;
+};
+
+export default ConflictDialog;

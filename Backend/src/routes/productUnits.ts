@@ -5,7 +5,7 @@ const router = Router({ mergeParams: true });
 
 router.get('/', async (req, res) => {
     try {
-        const { migrationId } = req.params;
+        const { migrationId } = (req.params as any);
         const productUnits = await prisma.productUnit.findMany({
             where: { product: { migrationId } },
             include: { unit: true }
@@ -18,7 +18,7 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
     try {
-        const { migrationId } = req.params;
+        const { migrationId } = (req.params as any);
         const { productId, unitId, conversionToBase, isBaseUnit, sellPrice, purchasePrice } = req.body;
 
         if (!productId || !unitId || conversionToBase === undefined) {
@@ -80,7 +80,7 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
     try {
-        const { migrationId, id } = req.params;
+        const { migrationId, id } = (req.params as any);
         const { conversionToBase, isBaseUnit, sellPrice, purchasePrice, version } = req.body;
 
         if (!version) return res.status(400).json({ error: 'Base version is required' });
@@ -130,7 +130,7 @@ router.patch('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
     try {
-        const { migrationId, id } = req.params;
+        const { migrationId, id } = (req.params as any);
 
         const current = await prisma.productUnit.findUnique({ where: { id }, include: { product: true } });
         if (!current || current.product.migrationId !== migrationId) {

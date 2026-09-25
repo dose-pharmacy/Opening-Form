@@ -5,7 +5,7 @@ const router = Router({ mergeParams: true });
 
 router.get('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     const units = await prisma.unit.findMany({
       where: { migrationId }
     });
@@ -17,7 +17,7 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     let { name, symbol, description } = req.body;
     
     if (!name || typeof name !== 'string') {
@@ -54,7 +54,7 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
     const { name, symbol, description, version } = req.body;
 
     if (!version) {
@@ -96,7 +96,7 @@ router.patch('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
 
     const puCount = await prisma.productUnit.count({
         where: { unitId: id }

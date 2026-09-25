@@ -31,6 +31,7 @@ model Migration {
   products       Product[]
   batches        Batch[]
   openingStocks  OpeningStock[]
+  ProcessedOperations ProcessedOperation[]
 }
 
 model ProductGroup {

@@ -6,7 +6,7 @@ const router = Router({ mergeParams: true });
 // GET /migrations/:migrationId/locations
 router.get('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     const locations = await prisma.location.findMany({
       where: { migrationId }
     });
@@ -19,7 +19,7 @@ router.get('/', async (req, res) => {
 // POST /migrations/:migrationId/locations
 router.post('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     let { name, description } = req.body;
     
     if (!name || typeof name !== 'string') {
@@ -57,7 +57,7 @@ router.post('/', async (req, res) => {
 // PATCH /migrations/:migrationId/locations/:id
 router.patch('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
     const { name, description, version } = req.body;
 
     if (!version) {
@@ -99,7 +99,7 @@ router.patch('/:id', async (req, res) => {
 // DELETE /migrations/:migrationId/locations/:id
 router.delete('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
 
     const stockCount = await prisma.openingStock.count({
         where: { locationId: id }

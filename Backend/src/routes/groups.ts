@@ -6,7 +6,7 @@ const router = Router({ mergeParams: true });
 // GET /migrations/:migrationId/groups
 router.get('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     const groups = await prisma.productGroup.findMany({
       where: { migrationId }
     });
@@ -19,7 +19,7 @@ router.get('/', async (req, res) => {
 // POST /migrations/:migrationId/groups
 router.post('/', async (req, res) => {
   try {
-    const { migrationId } = req.params;
+    const { migrationId } = (req.params as any);
     let { name } = req.body;
     
     if (!name || typeof name !== 'string') {
@@ -59,7 +59,7 @@ router.post('/', async (req, res) => {
 // PATCH /migrations/:migrationId/groups/:id
 router.patch('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
     const { name, version } = req.body;
 
     if (!version) {
@@ -103,7 +103,7 @@ router.patch('/:id', async (req, res) => {
 // DELETE /migrations/:migrationId/groups/:id
 router.delete('/:id', async (req, res) => {
   try {
-    const { migrationId, id } = req.params;
+    const { migrationId, id } = (req.params as any);
 
     // Check if group is referenced by any product
     const productCount = await prisma.product.count({

@@ -5,7 +5,7 @@ const router = Router({ mergeParams: true });
 
 router.get('/', async (req, res) => {
     try {
-        const { migrationId } = req.params;
+        const { migrationId } = (req.params as any);
         const batches = await prisma.batch.findMany({
             where: { migrationId },
             include: { product: true }
@@ -18,7 +18,7 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
     try {
-        const { migrationId } = req.params;
+        const { migrationId } = (req.params as any);
         const { productId, batchNumber, expiryDate, manufacturingDate, receivedDate, supplierReference } = req.body;
 
         if (!productId || !batchNumber || !expiryDate) {
@@ -68,7 +68,7 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
     try {
-        const { migrationId, id } = req.params;
+        const { migrationId, id } = (req.params as any);
         const { batchNumber, expiryDate, manufacturingDate, receivedDate, supplierReference, version } = req.body;
 
         if (!version) return res.status(400).json({ error: 'Base version is required' });
@@ -100,7 +100,7 @@ router.patch('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
     try {
-        const { migrationId, id } = req.params;
+        const { migrationId, id } = (req.params as any);
 
         const stockCount = await prisma.openingStock.count({ where: { batchId: id } });
         if (stockCount > 0) return res.status(409).json({ error: 'Cannot delete batch because it is referenced by stock.' });

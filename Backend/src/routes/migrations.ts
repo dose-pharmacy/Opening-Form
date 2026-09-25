@@ -24,7 +24,7 @@ router.post('/', async (req, res) => {
 // GET /migrations/:id
 router.get('/:id', async (req, res) => {
   try {
-    const { id } = req.params;
+    const { id } = (req.params as any);
     const migration = await prisma.migration.findUnique({
       where: { id }
     });
@@ -42,7 +42,7 @@ router.get('/:id', async (req, res) => {
 // PATCH /migrations/:id
 router.patch('/:id', async (req, res) => {
   try {
-    const { id } = req.params;
+    const { id } = (req.params as any);
     const { name, status } = req.body;
     
     // We only allow name and status to be updated directly
@@ -64,7 +64,7 @@ router.patch('/:id', async (req, res) => {
 // GET /migrations/:id/summary
 router.get('/:id/summary', async (req, res) => {
   try {
-    const { id } = req.params;
+    const { id } = (req.params as any);
 
     const migration = await prisma.migration.findUnique({
       where: { id },
@@ -118,7 +118,7 @@ router.get('/:id/summary', async (req, res) => {
 // GET /migrations/:id/changes
 router.get('/:id/changes', async (req, res) => {
   try {
-    const { id } = req.params;
+    const { id } = (req.params as any);
     const sinceRevision = Number(req.query.sinceRevision) || 0;
 
     const migration = await prisma.migration.findUnique({
@@ -171,7 +171,7 @@ router.get('/:id/changes', async (req, res) => {
 // GET /migrations/:id/export
 router.get('/:id/export', async (req, res) => {
   try {
-    const { id } = req.params;
+    const { id } = (req.params as any);
     const migration = await prisma.migration.findUnique({
       where: { id }
     });
@@ -244,7 +244,7 @@ router.get('/:id/export', async (req, res) => {
          const l = locations.find(loc => loc.id === os.locationId);
          
          // Assuming unitBreakdown is stored as an array of { unitId, quantity }
-         let quantities = [];
+         let quantities: any[] = [];
          try {
              const breakdown = typeof os.unitBreakdown === 'string' ? JSON.parse(os.unitBreakdown) : os.unitBreakdown;
              if (Array.isArray(breakdown)) {

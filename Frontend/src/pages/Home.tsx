@@ -34,6 +34,11 @@ import { ReviewDialog } from '../components/ReviewDialog';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SyncStatusIndicator } from '../components/SyncStatusIndicator';
 import { ConflictDialog } from '../components/ConflictDialog';
+import { syncDraft } from '../sync/pushDraft';
+import { SyncManager } from '../sync/syncManager';
+
+/** The workspace reuses one server migration across reloads. */
+const MIGRATION_ID_KEY = 'pharmacy_migration_id';
 
 const DEFAULT_UNITS: UnitDefinition[] = [
   { name: 'Tablet', symbol: 'tab' },
@@ -101,16 +106,104 @@ const Home: React.FC = () => {
   const [focusEntryId, setFocusEntryId] = useState<string | null>(null);
   const [resetFiltersToken, setResetFiltersToken] = useState(0);
   
-  // Phase 1 basic integration: get or create a default migrationId
-  const [migrationId, setMigrationId] = useState<string | null>(null);
+  // ── Server migration identity ──────────────────────────────────────
+  const [migrationId, setMigrationId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(MIGRATION_ID_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const [syncToken, setSyncToken] = useState(0);
 
+  // Reuse the stored migration; only create one when the server no longer has it.
   useEffect(() => {
-    migrationApi.createMigration('Default Pharmacy Migration')
-      .then(res => setMigrationId(res.id))
-      .catch(console.error);
+    let cancelled = false;
+
+    const ensureMigration = async () => {
+      const stored = (() => {
+        try {
+          return localStorage.getItem(MIGRATION_ID_KEY);
+        } catch {
+          return null;
+        }
+      })();
+
+      if (stored) {
+        try {
+          await migrationApi.getMigration(stored);
+          if (!cancelled) setMigrationId(stored);
+          return;
+        } catch (error: any) {
+          // The stored migration is only abandoned when the server explicitly
+          // says it is gone. An outage must not orphan the draft's identity.
+          if (error?.status !== 404) {
+            if (!cancelled) setMigrationId(stored);
+            return;
+          }
+          try {
+            localStorage.removeItem(MIGRATION_ID_KEY);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+
+      try {
+        const created = await migrationApi.createMigration('Opening Inventory Migration');
+        try {
+          localStorage.setItem(MIGRATION_ID_KEY, created.id);
+        } catch {
+          /* ignore */
+        }
+        if (!cancelled) setMigrationId(created.id);
+      } catch (error) {
+        // Offline: keep working on the draft, retry when the connection returns.
+        console.warn('Could not reach the migration service yet.', error);
+      }
+    };
+
+    ensureMigration();
+    window.addEventListener('online', ensureMigration);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('online', ensureMigration);
+    };
   }, []);
 
   const firstRun = useRef(true);
+
+  // ── Outbox sync ────────────────────────────────────────────────────
+  // The draft is the source of truth: every change is diffed into server
+  // operations, queued locally, and pushed (retried until it lands).
+  const dataRef = useRef(data);
+  dataRef.current = data;
+
+  useEffect(() => {
+    if (!migrationId) return;
+    const timer = setTimeout(() => {
+      syncDraft(migrationId, data)
+        .then((result) => {
+          if (result.queued > 0 || result.pruned > 0) setSyncToken((token) => token + 1);
+        })
+        .catch((error) => console.error('Failed to queue changes for sync', error));
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [data, migrationId]);
+
+  // Coming back online: queue whatever changed while offline, then push. The
+  // pending operations were never discarded, so nothing local is lost.
+  useEffect(() => {
+    if (!migrationId) return;
+    const flush = () => {
+      syncDraft(migrationId, dataRef.current)
+        .then(() => SyncManager.flushMigration(migrationId))
+        .then(() => setSyncToken((token) => token + 1))
+        .catch((error) => console.warn('Sync on reconnect failed', error));
+    };
+    window.addEventListener('online', flush);
+    return () => window.removeEventListener('online', flush);
+  }, [migrationId]);
 
   // ── Persistence ────────────────────────────────────────────────────
   useEffect(() => {
@@ -162,13 +255,11 @@ const Home: React.FC = () => {
   // ── Catalogue helpers ──────────────────────────────────────────────
   const createGroup = useCallback((name: string) => {
     setData((prev) => ({ ...prev, productGroups: addNamed(prev.productGroups, name, (n) => ({ name: n })) }));
-    if (migrationId) migrationApi.createGroup(migrationId, { name }).catch(console.error);
-  }, [migrationId]);
+  }, []);
 
   const createLocation = useCallback((name: string) => {
     setData((prev) => ({ ...prev, locations: addNamed(prev.locations, name, (n) => ({ name: n })) }));
-    if (migrationId) migrationApi.createLocation(migrationId, { name }).catch(console.error);
-  }, [migrationId]);
+  }, []);
 
   const createSupplier = useCallback((name: string) => {
     setData((prev) => ({ ...prev, suppliers: addNamed(prev.suppliers, name, (n) => ({ name: n })) }));
@@ -180,8 +271,7 @@ const Home: React.FC = () => {
       ...prev,
       units: addNamed(prev.units, name, (n) => ({ name: n, symbol: '' })),
     }));
-    if (migrationId) migrationApi.createUnit(migrationId, { name }).catch(console.error);
-  }, [migrationId]);
+  }, []);
 
   const updateUnitSymbol = useCallback((name: string, symbol: string) => {
     setData((prev) => ({
@@ -377,18 +467,10 @@ const Home: React.FC = () => {
       });
       setProductEditor(null);
       toast.success(`Product "${product.name}" saved`);
-      
-      if (migrationId) {
-        migrationApi.createProduct(migrationId, {
-          sku: product.sku,
-          name: product.name,
-          brand: product.brand,
-          description: product.description,
-          isActive: true
-        }).catch(console.error);
-      }
+      // Persistence is handled by the outbox sync effect: it diffs the draft and
+      // queues a parent-first UPSERT for the product and its units.
     },
-    [productEditor, migrationId]
+    [productEditor]
   );
 
   // ── Stock / batch dialogs ──────────────────────────────────────────
@@ -398,21 +480,8 @@ const Home: React.FC = () => {
       patchEntry(stockEntryId, { quantities });
       setStockEntryId(null);
       toast.success('Opening stock updated');
-      
-      // Basic API integration
-      if (migrationId && stockEntryId) {
-        const entry = data.openingStock.find(e => e.id === stockEntryId);
-        if (entry && entry.productSku && entry.batchNumber && entry.location) {
-           migrationApi.createOpeningStock(migrationId, {
-             productId: entry.productSku, // Assuming backend expects SKU or resolved ID
-             batchId: entry.batchNumber,
-             locationId: entry.location,
-             unitBreakdown: quantities.map(q => ({ unitId: q.unit, quantity: q.value }))
-           }).catch(console.error);
-        }
-      }
     },
-    [patchEntry, stockEntryId, data.openingStock, migrationId]
+    [patchEntry, stockEntryId]
   );
 
   const handleSaveBatch = useCallback(
@@ -443,16 +512,8 @@ const Home: React.FC = () => {
       });
       setBatchEntryId(null);
       toast.success('Batch details saved');
-      
-      if (migrationId) {
-        migrationApi.createBatch(migrationId, {
-          productId: batch.productSku,
-          batchNumber: batch.batchNumber,
-          expiryDate: batch.expiryDate,
-        }).catch(console.error);
-      }
     },
-    [batchEntry, migrationId]
+    [batchEntry]
   );
 
   // ── Import / export ────────────────────────────────────────────────
@@ -462,12 +523,25 @@ const Home: React.FC = () => {
       setReviewOpen(true);
       return;
     }
-    
-    // Final sync check
-    const pendingOps = await import('../sync/queue').then(m => m.OperationQueue.countPending(migrationId!));
-    if (pendingOps > 0 || !navigator.onLine) {
-        toast.error('Cannot export until all changes are safely synchronized with the server.');
-        return;
+
+    if (!migrationId) {
+      toast.error('The migration service is unreachable — the server copy cannot be exported yet.');
+      return;
+    }
+
+    // The export is produced from the server copy, so everything must be pushed first.
+    const summary = await SyncManager.flushMigration(migrationId);
+    setSyncToken((token) => token + 1);
+    if (summary.remaining > 0) {
+      toast.error(
+        `Cannot export yet: ${summary.remaining} change(s) have not reached the server. Retrying automatically.`
+      );
+      return;
+    }
+    if (summary.conflicts > 0 || summary.errors > 0) {
+      toast.error('Resolve the sync issues before exporting.');
+      setConflictsOpen(true);
+      return;
     }
 
     try {
@@ -493,7 +567,7 @@ const Home: React.FC = () => {
     } catch {
       toast.error('Export failed — could not fetch canonical JSON from server.');
     }
-  }, [data, validation, migrationId]);
+  }, [validation, migrationId]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -615,7 +689,11 @@ const Home: React.FC = () => {
           <Metric label="Warnings" value={counts.warnings} tone="warn" />
           <Metric label="Errors" value={counts.errors} tone="bad" />
           <div className="ml-auto flex items-center gap-4 text-xs">
-            <SyncStatusIndicator migrationId={migrationId} onReviewConflicts={() => setConflictsOpen(true)} />
+            <SyncStatusIndicator
+              migrationId={migrationId}
+              refreshToken={syncToken}
+              onReviewConflicts={() => setConflictsOpen(true)}
+            />
             {isStorageAvailable() ? (
               <div className="flex items-center gap-1">
                 <HardDriveDownload className="h-3.5 w-3.5 text-accent" />

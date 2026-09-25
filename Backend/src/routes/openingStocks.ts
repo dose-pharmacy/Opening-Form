@@ -5,7 +5,7 @@ const router = Router({ mergeParams: true });
 
 router.get('/', async (req, res) => {
     try {
-        const { migrationId } = req.params;
+        const { migrationId } = (req.params as any);
         const stocks = await prisma.openingStock.findMany({
             where: { migrationId },
             include: { batch: true, location: true, product: true }
@@ -18,7 +18,7 @@ router.get('/', async (req, res) => {
 
 router.post('/', async (req, res) => {
     try {
-        const { migrationId } = req.params;
+        const { migrationId } = (req.params as any);
         const { productId, batchId, locationId, unitBreakdown, unitCost } = req.body;
 
         if (!productId || !batchId || !locationId || !Array.isArray(unitBreakdown)) {
@@ -82,7 +82,7 @@ router.post('/', async (req, res) => {
 
 router.patch('/:id', async (req, res) => {
     try {
-        const { migrationId, id } = req.params;
+        const { migrationId, id } = (req.params as any);
         const { unitBreakdown, unitCost, version } = req.body;
 
         if (!version) return res.status(400).json({ error: 'Base version is required' });
@@ -125,7 +125,7 @@ router.patch('/:id', async (req, res) => {
 
 router.delete('/:id', async (req, res) => {
     try {
-        const { migrationId, id } = req.params;
+        const { migrationId, id } = (req.params as any);
 
         await prisma.openingStock.delete({ where: { id, migrationId } });
 
