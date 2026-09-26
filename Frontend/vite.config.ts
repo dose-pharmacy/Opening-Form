@@ -12,6 +12,11 @@ export default defineConfig({
     },
   },
   logLevel: 'info', 
+  test: {
+    environment: 'node',
+    include: ['src/**/*.test.ts'],
+    setupFiles: ['./src/test/setup.ts'],
+  },
   build: {
     rollupOptions: {
       onwarn(warning, warn) {

@@ -13,6 +13,13 @@ const router = Router({ mergeParams: true });
  *  - each accepted change costs exactly one write;
  *  - operations are UPSERTs keyed by business identifier, so re-sending a draft
  *    never produces a bogus conflict.
+ *
+ * Idempotency:
+ *  every applied operation is recorded in `ProcessedOperation` together with the
+ *  result it produced. A retry carrying an `operationId` the server has already
+ *  seen returns that stored result instead of doing the work again, so a lost
+ *  response (the host sleeps, the browser never sees the reply) can never create
+ *  a duplicate record.
  */
 
 type EntityType =
@@ -500,7 +507,7 @@ const sameValue = (left: unknown, right: unknown): boolean => {
 const isAlreadyApplied = (data: AnyRow, current: AnyRow): boolean =>
   Object.keys(data).every((key) => sameValue(data[key], current[key]));
 
-async function processOperation(catalogue: Catalogue, op: AnyRow) {
+async function processOperation(catalogue: Catalogue, op: AnyRow, client: any = prisma) {
   const { operationId, entityType, operationType, baseVersion } = op;
   const definition = ENTITIES[entityType as EntityType];
 
@@ -508,13 +515,15 @@ async function processOperation(catalogue: Catalogue, op: AnyRow) {
     return { operationId, status: 'ERROR', error: `Unknown entity type "${entityType}".` };
   }
 
-  const delegate = (prisma as any)[definition.store];
+  const delegate = (client as any)[definition.store];
   const payload: AnyRow = op.payload ?? {};
 
   if (operationType === 'DELETE') {
     const row = definition.byId?.(catalogue, op.entityId);
     if (!row) {
-      return { operationId, status: 'SYNCED', entityType, entityId: op.entityId, version: 0 };
+      // Nothing to delete: the delete is still satisfied, so the client may
+      // clean up its tombstone.
+      return { operationId, status: 'SYNCED', entityType, entityId: op.entityId, version: 0, deleted: true };
     }
     await delegate.delete({ where: { id: row.id } });
     unindexRow(catalogue, definition.store, row);
@@ -604,6 +613,61 @@ async function processOperation(catalogue: Catalogue, op: AnyRow) {
   };
 }
 
+/**
+ * Look up a previously applied operation.
+ *
+ * A retry of an operation the server already committed must return the stored
+ * outcome instead of running it again — this is what stops a duplicate CREATE
+ * when the response to the first attempt was lost.
+ */
+async function findProcessed(operationId: string): Promise<any | undefined> {
+  try {
+    const record = await prisma.processedOperation.findUnique({ where: { operationId } });
+    return record?.result ?? undefined;
+  } catch (error: any) {
+    // The table is optional infrastructure: if it is unavailable we fall back to
+    // the content-based no-op check the entity definitions already perform.
+    if (error?.code === 'P2021' || error?.code === 'P2022') {
+      console.warn('ProcessedOperation is unavailable; relying on content comparison only.');
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Apply one operation and record its outcome in a single transaction.
+ *
+ * Writing the row and the ledger entry separately leaves a window in which the
+ * row is committed but unrecorded: a retry would then apply the change a second
+ * time. Committing both together means a retry either finds the recorded result
+ * or re-runs work that never landed.
+ *
+ * The in-memory catalogue is only valid for the duration of one operation, so
+ * the caller reloads it if this throws.
+ */
+async function applyAndRecord(
+  migrationId: string,
+  operationId: string,
+  catalogue: Catalogue,
+  op: AnyRow
+): Promise<any> {
+  return prisma.$transaction(async (tx: any) => {
+    const result = await processOperation(catalogue, op, tx);
+    if (result.status !== 'SYNCED') return result;
+
+    try {
+      await tx.processedOperation.create({ data: { operationId, migrationId, result: result as any } });
+    } catch (error: any) {
+      // Another worker recorded this operation first, or the ledger table is not
+      // deployed yet: either way the change itself is sound.
+      if (error?.code === 'P2002' || error?.code === 'P2021' || error?.code === 'P2022') return result;
+      throw error;
+    }
+    return result;
+  });
+}
+
 router.post('/', async (req, res) => {
   const { migrationId } = req.params as any;
   const { operations } = req.body ?? {};
@@ -615,8 +679,38 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'Operations must be an array' });
   }
 
-  const needed = new Set<StoreKey>();
+  // ── Replay guard ────────────────────────────────────────────────────
+  // Operations already applied are answered from the ledger and never
+  // re-executed, so an interrupted request is safe to retry.
+  const results: any[] = [];
+  let replayedOperations = 0;
+  const fresh: any[] = [];
+
   for (const op of operations) {
+    const operationId = op?.operationId;
+    if (!operationId) {
+      fresh.push(op);
+      continue;
+    }
+    try {
+      const seen = await findProcessed(operationId);
+      if (seen) {
+        replayedOperations += 1;
+        results.push({ ...seen, operationId, replayed: true });
+        continue;
+      }
+    } catch (error) {
+      console.error('Could not read the processed-operation ledger', error);
+    }
+    fresh.push(op);
+  }
+
+  if (fresh.length === 0) {
+    return res.json({ results, revision: undefined, successfulOperations: 0, replayedOperations });
+  }
+
+  const needed = new Set<StoreKey>();
+  for (const op of fresh) {
     (REQUIRED_STORES[op?.entityType as EntityType] ?? []).forEach((key) => needed.add(key));
   }
 
@@ -636,10 +730,9 @@ router.post('/', async (req, res) => {
     return res.status(500).json({ error: 'Could not load migration state' });
   }
 
-  const results: any[] = [];
   let successfulOperations = 0;
 
-  for (const op of operations) {
+  for (const op of fresh) {
     const { operationId, entityType, entityId, operationType } = op ?? {};
 
     if (!operationId || !entityType || !entityId || !operationType) {
@@ -653,7 +746,7 @@ router.post('/', async (req, res) => {
     }
 
     try {
-      const result = await processOperation(catalogue, op);
+      const result = await applyAndRecord(migrationId, operationId, catalogue, op);
       if (result.status === 'SYNCED') successfulOperations += 1;
       results.push(result);
     } catch (error: any) {
@@ -687,6 +780,15 @@ router.post('/', async (req, res) => {
         }
       }
 
+      // The transaction rolled back, so the in-memory catalogue no longer matches
+      // the database. Reload it before applying anything else in this batch.
+      try {
+        const reloaded = await loadCatalogue(migrationId, needed);
+        Object.assign(catalogue, reloaded);
+      } catch (reloadError) {
+        console.error('Could not reload migration state after a rollback', reloadError);
+      }
+
       results.push({
         operationId,
         status: 'ERROR',
@@ -711,7 +813,7 @@ router.post('/', async (req, res) => {
     }
   }
 
-  res.json({ results, revision, successfulOperations });
+  res.json({ results, revision, successfulOperations, replayedOperations });
 });
 
 export default router;

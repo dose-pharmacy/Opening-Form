@@ -159,7 +159,12 @@ router.get('/:id/summary', async (req, res) => {
     res.status(500).json({ error: 'Failed to retrieve migration summary' });
   }
 });
-// GET /migrations/:id/changes
+// GET /migrations/:id/changes?sinceRevision=N
+//
+// The client stores `lastKnownRevision` and asks for everything after it, so a
+// reopen only reconciles what actually changed. There is no event log: the
+// endpoint returns the current state of the migration plus the revision window,
+// and the client skips rows that already match or that it has pending work for.
 router.get('/:id/changes', async (req, res) => {
   try {
     const { id } = (req.params as any);
@@ -174,15 +179,24 @@ router.get('/:id/changes', async (req, res) => {
     }
 
     if (migration.revision <= sinceRevision) {
-      return res.json({ migrationId: id, fromRevision: sinceRevision, toRevision: migration.revision, changes: [] });
+      // Same shape as the full response below, just empty: a caller can always
+      // read `state` without having to check which branch it got.
+      return res.json({
+        migrationId: id,
+        fromRevision: sinceRevision,
+        toRevision: migration.revision,
+        state: {
+          groups: [],
+          locations: [],
+          units: [],
+          products: [],
+          productUnits: [],
+          batches: [],
+          openingStocks: [],
+        },
+      });
     }
 
-    // Instead of querying ProcessedOperation (which only gives operations, not the latest entity state),
-    // and since the requirements allow a simple approach without a complex event log,
-    // we can return the entire current state of all entities so the client can diff them.
-    // However, the prompt specifically requested a change feed format if possible:
-    // "Implement a simple change-feed mechanism if it does not already exist... Adapt the exact response to the existing architecture. Do not create an unnecessarily complicated event system."
-    // Let's just return the full current state and the current revision. The client will reconcile based on versions.
     const [groups, locations, units, products, productUnits, batches, openingStocks] = await Promise.all([
       prisma.productGroup.findMany({ where: { migrationId: id } }),
       prisma.location.findMany({ where: { migrationId: id } }),
@@ -195,6 +209,7 @@ router.get('/:id/changes', async (req, res) => {
 
     res.json({
       migrationId: id,
+      fromRevision: sinceRevision,
       toRevision: migration.revision,
       state: {
         groups,

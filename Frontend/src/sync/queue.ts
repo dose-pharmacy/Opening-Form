@@ -1,3 +1,13 @@
+/**
+ * The outbox: explicit operations that still owe the server something.
+ *
+ * The queue is the *only* thing that produces deletes — nothing is ever
+ * inferred from a row disappearing from an array. Every operation carries a
+ * stable `operationId` so a retry (offline, lost response, a sleeping host that
+ * woke up mid-flight) is recognised by the backend instead of being applied
+ * twice.
+ */
+
 import { getDB } from '../local-store/db';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -33,6 +43,8 @@ export interface SyncOperation {
   status: OperationStatus;
   retryCount: number;
   lastError?: string;
+  /** When this run claimed the operation; used to reclaim abandoned work. */
+  claimedAt?: number;
 }
 
 export interface ConflictRecord {
@@ -45,6 +57,15 @@ export interface ConflictRecord {
   error?: string;
 }
 
+export interface OutboxCounts {
+  pending: number;
+  conflicts: number;
+  errors: number;
+}
+
+/** A claim older than this belonged to a run that never finished (host slept). */
+export const CLAIM_TIMEOUT_MS = 60_000;
+
 let lastSequence = 0;
 const nextSequence = (): number => {
   const candidate = Date.now() * 1000;
@@ -53,6 +74,7 @@ const nextSequence = (): number => {
 };
 
 export const OperationQueue = {
+  /** Add an operation to the outbox and return it (with its operationId). */
   async enqueue(
     migrationId: string,
     entityType: EntityType,
@@ -81,6 +103,49 @@ export const OperationQueue = {
     return op;
   },
 
+  /**
+   * Replace the queued payload for an entity instead of stacking a new
+   * operation on top of it.
+   *
+   * Editing a row ten times offline must still send one request that carries the
+   * final state, while keeping the operationId the server already knows about.
+   */
+  async upsertPending(
+    migrationId: string,
+    entityType: EntityType,
+    entityId: string,
+    operationType: OperationType,
+    payload: any,
+    baseVersion?: number
+  ): Promise<SyncOperation> {
+    const db = await getDB();
+    const existing = (await db.getAllFromIndex('operations', 'by-migration', migrationId)) as
+      | SyncOperation[]
+      | undefined;
+
+    const coalescible = (existing ?? [])
+      .filter((op) => op.entityId === entityId && (op.status === 'PENDING' || op.status === 'FAILED'))
+      .sort((a, b) => a.sequence - b.sequence)[0];
+
+    if (coalescible) {
+      // A create that never reached the server stays a create.
+      const nextType: OperationType =
+        coalescible.operationType === 'CREATE' && operationType === 'UPDATE' ? 'CREATE' : operationType;
+      const updated: SyncOperation = {
+        ...coalescible,
+        operationType: nextType,
+        payload,
+        baseVersion: baseVersion ?? coalescible.baseVersion,
+        status: 'PENDING',
+        lastError: undefined,
+      };
+      await db.put('operations', updated);
+      return updated;
+    }
+
+    return this.enqueue(migrationId, entityType, entityId, operationType, payload, baseVersion);
+  },
+
   /** Operations still owed to the server, oldest (dependency-first) first. */
   async getPendingOperations(migrationId: string): Promise<SyncOperation[]> {
     const db = await getDB();
@@ -91,7 +156,7 @@ export const OperationQueue = {
     )) as unknown as SyncOperation[];
     return allOps
       .filter((op) => op.status === 'PENDING' || op.status === 'FAILED')
-      .sort((a, b) => (a.sequence ?? a.createdAt) - (b.sequence ?? b.createdAt));
+      .sort((a, b) => a.sequence - b.sequence);
   },
 
   async getOperationsForEntity(migrationId: string, entityId: string): Promise<SyncOperation[]> {
@@ -101,26 +166,35 @@ export const OperationQueue = {
       'by-migration',
       migrationId
     )) as unknown as SyncOperation[];
-    return allOps.filter((op) => op.entityId === entityId);
+    return allOps.filter((op) => op.entityId === entityId).sort((a, b) => a.sequence - b.sequence);
+  },
+
+  async getOperationsForMigration(migrationId: string): Promise<SyncOperation[]> {
+    const db = await getDB();
+    return (await db.getAllFromIndex('operations', 'by-migration', migrationId)) as unknown as SyncOperation[];
   },
 
   /**
-   * Reclaim operations left behind by an interrupted sync. Without this, an
-   * operation stuck in SYNCING is never retried again — the queue silently
-   * stalls and nothing ever reaches the server.
+   * Reclaim operations left behind by an interrupted run.
+   *
+   * When the host sleeps mid-request the browser may never come back to release
+   * the claim, and an operation stuck in SYNCING would be invisible to the queue
+   * forever. Anything claimed longer than CLAIM_TIMEOUT_MS goes back to PENDING —
+   * retrying it is safe because the operationId is stable.
    */
-  async resetStuckOperations(migrationId?: string): Promise<number> {
+  async resetStuckOperations(migrationId?: string, now: number = Date.now()): Promise<number> {
     const db = await getDB();
     const allOps = migrationId
-      ? await db.getAllFromIndex('operations', 'by-migration', migrationId)
-      : await db.getAll('operations');
+      ? ((await db.getAllFromIndex('operations', 'by-migration', migrationId)) as unknown as SyncOperation[])
+      : ((await db.getAll('operations')) as unknown as SyncOperation[]);
+
     let reset = 0;
     for (const op of allOps) {
-      if (op.status === 'SYNCING') {
-        op.status = 'PENDING';
-        await db.put('operations', op);
-        reset += 1;
-      }
+      if (op.status !== 'SYNCING') continue;
+      const claimedAt = op.claimedAt ?? 0;
+      if (now - claimedAt < CLAIM_TIMEOUT_MS) continue;
+      await db.put('operations', { ...op, status: 'PENDING', claimedAt: undefined });
+      reset += 1;
     }
     return reset;
   },
@@ -132,15 +206,27 @@ export const OperationQueue = {
       const op = await tx.store.get(id);
       if (op) {
         op.status = 'SYNCING';
+        op.claimedAt = Date.now();
         await tx.store.put(op);
       }
     }
     await tx.done;
   },
 
+  /** Release a claim without counting it as a failure (host went to sleep). */
+  async releaseClaim(operationId: string): Promise<void> {
+    const db = await getDB();
+    const op = await db.get('operations', operationId);
+    if (!op) return;
+    op.status = 'PENDING';
+    op.claimedAt = undefined;
+    await db.put('operations', op);
+  },
+
   async removeOperation(operationId: string): Promise<void> {
     const db = await getDB();
     await db.delete('operations', operationId);
+    await db.delete('conflicts', operationId);
   },
 
   /**
@@ -154,6 +240,7 @@ export const OperationQueue = {
       op.status = retryable ? 'FAILED' : 'ERROR';
       op.lastError = error;
       op.retryCount += 1;
+      op.claimedAt = undefined;
       await db.put('operations', op);
     }
   },
@@ -163,6 +250,7 @@ export const OperationQueue = {
     const op = await db.get('operations', operationId);
     if (op) {
       op.status = 'CONFLICT';
+      op.claimedAt = undefined;
       await db.put('operations', op);
       await db.put('conflicts', {
         operationId,
@@ -181,6 +269,7 @@ export const OperationQueue = {
     op.status = 'PENDING';
     op.retryCount = 0;
     op.lastError = undefined;
+    op.claimedAt = undefined;
     if (baseVersion !== undefined) op.baseVersion = baseVersion;
     await db.put('operations', op);
     await db.delete('conflicts', operationId);
@@ -191,7 +280,7 @@ export const OperationQueue = {
     return (await db.get('conflicts', operationId)) as ConflictRecord | undefined;
   },
 
-  /** Changes still owed to the server (drives the export gate). */
+  /** Changes still owed to the server (drives the export gate and the UI). */
   async countPending(migrationId: string): Promise<number> {
     const db = await getDB();
     const allOps = await db.getAllFromIndex('operations', 'by-migration', migrationId);
@@ -208,6 +297,14 @@ export const OperationQueue = {
       conflicts: allOps.filter((op) => op.status === 'CONFLICT').length,
       errors: allOps.filter((op) => op.status === 'ERROR').length,
     };
+  },
+
+  async counts(migrationId: string): Promise<OutboxCounts> {
+    const [pending, issues] = await Promise.all([
+      this.countPending(migrationId),
+      this.countIssues(migrationId),
+    ]);
+    return { pending, conflicts: issues.conflicts, errors: issues.errors };
   },
 
   /** Drop every queued operation for a migration (used when replacing a draft). */

@@ -1,17 +1,9 @@
-import type { MigrationData } from './types';
+const METADATA_KEY = 'pharmacy_opening_metadata';
 
-const STORAGE_KEY = 'pharmacy_opening_inventory_draft';
-const LEGACY_KEY = 'pharmacy_migration_draft';
-
-export interface DraftEnvelope {
-  savedAt: string;
-  data: MigrationData;
-}
-
-export interface LoadResult {
-  data: MigrationData | null;
-  savedAt: string | null;
-  error: string | null;
+export interface Metadata {
+  activeMigrationId: string | null;
+  lastKnownRevision: number;
+  setupStatus: 'not_started' | 'in_progress' | 'completed';
 }
 
 export function isStorageAvailable(): boolean {
@@ -25,64 +17,45 @@ export function isStorageAvailable(): boolean {
   }
 }
 
-/**
- * Read the draft. Accepts both the current envelope format and the legacy
- * raw-document format so old drafts keep working.
- */
-export function loadDraft(): LoadResult {
-  if (!isStorageAvailable()) {
-    return { data: null, savedAt: null, error: 'Local storage is unavailable in this browser.' };
-  }
+function getMetadata(): Metadata {
+  if (!isStorageAvailable()) return { activeMigrationId: null, lastKnownRevision: 0, setupStatus: 'not_started' };
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY) ?? window.localStorage.getItem(LEGACY_KEY);
-    if (!raw) return { data: null, savedAt: null, error: null };
-    const parsed = JSON.parse(raw) as Partial<DraftEnvelope> & Partial<MigrationData>;
-    if (parsed && typeof parsed === 'object' && 'data' in parsed && parsed.data) {
-      return { data: parsed.data as MigrationData, savedAt: parsed.savedAt ?? null, error: null };
-    }
-    if (parsed && typeof parsed === 'object' && 'schemaVersion' in parsed) {
-      return { data: parsed as MigrationData, savedAt: null, error: null };
-    }
-    return { data: null, savedAt: null, error: 'The saved draft could not be read.' };
+    const raw = window.localStorage.getItem(METADATA_KEY);
+    if (!raw) return { activeMigrationId: null, lastKnownRevision: 0, setupStatus: 'not_started' };
+    return JSON.parse(raw);
   } catch {
-    return { data: null, savedAt: null, error: 'The saved draft is corrupted and could not be loaded.' };
+    return { activeMigrationId: null, lastKnownRevision: 0, setupStatus: 'not_started' };
   }
 }
 
-export interface SaveResult {
-  ok: boolean;
-  savedAt: string | null;
-  error: string | null;
+function setMetadata(data: Partial<Metadata>) {
+  if (!isStorageAvailable()) return;
+  const current = getMetadata();
+  const next = { ...current, ...data };
+  window.localStorage.setItem(METADATA_KEY, JSON.stringify(next));
 }
 
-export function saveDraft(data: MigrationData): SaveResult {
-  const savedAt = new Date().toISOString();
-  if (!isStorageAvailable()) {
-    return { ok: false, savedAt: null, error: 'Local storage is unavailable — the draft cannot be saved.' };
-  }
-  try {
-    const envelope: DraftEnvelope = { savedAt, data };
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(envelope));
-    return { ok: true, savedAt, error: null };
-  } catch (error) {
-    const isQuota =
-      error instanceof DOMException &&
-      (error.name === 'QuotaExceededError' || error.name === 'NS_ERROR_DOM_QUOTA_REACHED');
-    return {
-      ok: false,
-      savedAt: null,
-      error: isQuota
-        ? 'Local storage is full — export your JSON to keep your work safe.'
-        : 'Local storage is unavailable — the draft could not be saved.',
-    };
-  }
+export function getActiveMigrationId(): string | null {
+  return getMetadata().activeMigrationId;
 }
 
-export function clearDraft(): void {
-  try {
-    window.localStorage.removeItem(STORAGE_KEY);
-    window.localStorage.removeItem(LEGACY_KEY);
-  } catch {
-    /* ignore */
-  }
+export function setActiveMigrationId(id: string | null): void {
+  setMetadata({ activeMigrationId: id });
 }
+
+export function getMigrationRevision(): number {
+  return getMetadata().lastKnownRevision;
+}
+
+export function setMigrationRevision(rev: number): void {
+  setMetadata({ lastKnownRevision: rev });
+}
+
+export function getSetupStatus(): 'not_started' | 'in_progress' | 'completed' {
+  return getMetadata().setupStatus;
+}
+
+export function setSetupStatus(status: 'not_started' | 'in_progress' | 'completed'): void {
+  setMetadata({ setupStatus: status });
+}
+

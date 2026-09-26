@@ -1,9 +1,9 @@
 /**
  * Thin HTTP client for the migration service.
  *
- * Entity writes deliberately do NOT live here: every change is pushed through
- * the outbox (`sync/pushDraft.ts` + `sync/syncManager.ts`) so it survives being
- * offline, is ordered parent-first, and is retried instead of being lost.
+ * Entity writes deliberately do NOT live here: every change is pushed through the
+ * outbox (`sync/queue.ts` + `sync/syncManager.ts`) so it survives being offline, is
+ * ordered parent-first, and is retried instead of being lost.
  */
 
 import { API_BASE } from './apiBase';

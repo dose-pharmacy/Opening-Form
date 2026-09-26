@@ -16,14 +16,30 @@ import type {
   StatusFilter,
   StockEntry,
   StockQuantity,
-  UnitConfig,
   UnitDefinition,
 } from '../utils/types';
 import { SCHEMA_VERSION } from '../utils/types';
-import { resolveConversionFactors } from '../utils/conversions';
 import { validateMigration } from '../utils/validation';
-import { downloadJson, parseImport } from '../utils/serialize';
-import { isStorageAvailable, loadDraft, saveDraft } from '../utils/storage';
+import { parseImport } from '../utils/serialize';
+import {
+  isStorageAvailable,
+  getActiveMigrationId,
+  setSetupStatus,
+} from '../utils/storage';
+import { loadWorkspace } from '../local-store/entities';
+import { batchIdFor } from '../sync/payloads';
+import { OperationQueue } from '../sync/queue';
+import {
+  deleteRow,
+  deleteStockEntry,
+  importMigrationData,
+  saveBatch,
+  saveGroup,
+  saveLocation,
+  saveProduct,
+  saveStockEntry,
+  saveUnit,
+} from '../sync/workspaceOps';
 import { newId } from '../utils/ids';
 import { InventoryTable } from '../components/InventoryTable';
 import { migrationApi } from '../utils/migrationApi';
@@ -34,12 +50,9 @@ import { ReviewDialog } from '../components/ReviewDialog';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SyncStatusIndicator } from '../components/SyncStatusIndicator';
 import { ConflictDialog } from '../components/ConflictDialog';
-import { mirrorServerEntities, syncDraft } from '../sync/pushDraft';
-import { fetchServerDraft, mergeDraftData } from '../sync/hydrate';
-import { SyncManager } from '../sync/syncManager';
 
-/** The workspace reuses one server migration across reloads. */
-const MIGRATION_ID_KEY = 'pharmacy_migration_id';
+import { hydrateWorkspace, resolveMigrationId } from '../sync/hydrate';
+import { SyncManager } from '../sync/syncManager';
 
 const DEFAULT_UNITS: UnitDefinition[] = [
   { name: 'Tablet', symbol: 'tab' },
@@ -68,123 +81,17 @@ const createInitialData = (): MigrationData => ({
 const draftIsEmpty = (data: MigrationData): boolean =>
   data.openingStock.length === 0 && data.products.length === 0 && data.batches.length === 0;
 
-/** Drop batch records that no stock entry references any more. */
-const pruneBatches = (data: MigrationData): MigrationData => {
-  const referenced = new Set(
-    data.openingStock
-      .filter((e) => e.productSku && e.batchNumber)
-      .map((e) => `${e.productSku}::${e.batchNumber}`)
-  );
-  const batches = data.batches.filter((b) => referenced.has(`${b.productSku}::${b.batchNumber}`));
-  return batches.length === data.batches.length ? data : { ...data, batches };
-};
-
-const addNamed = <T extends { name: string }>(list: T[], name: string, factory: (name: string) => T): T[] => {
-  const trimmed = name.trim();
-  if (!trimmed || list.some((item) => item.name.toLowerCase() === trimmed.toLowerCase())) return list;
-  return [...list, factory(trimmed)];
-};
-
-type SaveState = 'saved' | 'saving' | 'error';
-
-const readStoredMigrationId = (): string | null => {
-  try {
-    return localStorage.getItem(MIGRATION_ID_KEY);
-  } catch {
-    return null;
-  }
-};
-
-const storeMigrationId = (id: string): void => {
-  try {
-    localStorage.setItem(MIGRATION_ID_KEY, id);
-  } catch {
-    /* ignore */
-  }
-};
-
-const clearStoredMigrationId = (): void => {
-  try {
-    localStorage.removeItem(MIGRATION_ID_KEY);
-  } catch {
-    /* ignore */
-  }
-};
-
-/** How much saved inventory a migration holds. */
-const migrationScore = (counts: Record<string, number> = {}): number =>
-  (counts.products ?? 0) +
-  (counts.batches ?? 0) +
-  (counts.openingStockRecords ?? 0) +
-  (counts.openingStocks ?? 0);
-
-/**
- * Pick the migration this workspace should use.
- *
- * The tool is one shared workspace, not one browser: when the stored id is gone
- * — or points at an empty migration because a fresh device created one — the
- * data already in the database must win, otherwise the table starts blank even
- * though the inventory is saved.
- */
-async function resolveMigrationId(stored: string | null): Promise<string | null> {
-  let candidate = stored;
-
-  if (candidate) {
-    try {
-      await migrationApi.getMigration(candidate);
-    } catch (error: any) {
-      if (error?.status === 404) {
-        // The server explicitly says it is gone; a new id is needed.
-        clearStoredMigrationId();
-        candidate = null;
-      } else {
-        // Service unreachable: keep the identity and work offline.
-        return candidate;
-      }
-    }
-  }
-
-  try {
-    const list = await migrationApi.listMigrations();
-    if (candidate) {
-      const own = list.find((migration) => migration.id === candidate);
-      if (own && migrationScore(own.counts) > 0) return candidate;
-    }
-    const richest = list
-      .filter((migration) => migrationScore(migration.counts) > 0)
-      .sort((a, b) => {
-        const diff = migrationScore(b.counts) - migrationScore(a.counts);
-        if (diff !== 0) return diff;
-        return new Date(b.lastActivityAt ?? 0).getTime() - new Date(a.lastActivityAt ?? 0).getTime();
-      })[0];
-    if (richest) {
-      storeMigrationId(richest.id);
-      return richest.id;
-    }
-  } catch {
-    // Backend without the list endpoint: fall back to the stored id below.
-  }
-
-  if (candidate) return candidate;
-
-  try {
-    const created = await migrationApi.createMigration('Opening Inventory Migration');
-    storeMigrationId(created.id);
-    return created.id;
-  } catch (error) {
-    console.warn('Could not reach the migration service yet.', error);
-    return null;
-  }
-}
+/** Hydration gate. Mutations and sync are forbidden until this is READY. */
+type HydrationStatus = 'LOADING' | 'READY' | 'ERROR';
+/** Runtime connection state, kept separate from hydration. */
+type SyncStatus = 'READY' | 'SYNCING' | 'OFFLINE' | 'SYNC_ERROR';
 
 const Home: React.FC = () => {
-  const [data, setData] = useState<MigrationData>(() => {
-    const { data: saved } = loadDraft();
-    return saved ?? createInitialData();
-  });
-  const [saveState, setSaveState] = useState<SaveState>('saved');
-  const [savedAt, setSavedAt] = useState<string | null>(null);
+  const [data, setData] = useState<MigrationData>(createInitialData);
+  const [hydration, setHydration] = useState<HydrationStatus>('LOADING');
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('READY');
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [hydratedFrom, setHydratedFrom] = useState<'LOCAL' | 'SERVER' | 'EMPTY' | 'OFFLINE' | null>(null);
 
   const [productEditor, setProductEditor] = useState<{ mode: 'new' } | { mode: 'edit'; sku: string } | null>(null);
   const [stockEntryId, setStockEntryId] = useState<string | null>(null);
@@ -196,126 +103,158 @@ const Home: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [focusEntryId, setFocusEntryId] = useState<string | null>(null);
   const [resetFiltersToken, setResetFiltersToken] = useState(0);
-  
+
   // ── Server migration identity ──────────────────────────────────────
-  const [migrationId, setMigrationId] = useState<string | null>(readStoredMigrationId);
+  const [migrationId, setMigrationId] = useState<string | null>(getActiveMigrationId);
   const [syncToken, setSyncToken] = useState(0);
+  /** Bumped by "Retry"; hydration cannot depend on the id alone (it may be null). */
+  const [hydrationToken, setHydrationToken] = useState(0);
 
-  // Resolve the migration that actually holds the saved inventory, so a new
-  // browser/device shows the data already in the database instead of a blank
-  // table. Retried when the connection returns.
-  useEffect(() => {
-    let cancelled = false;
-
-    const ensureMigration = async () => {
-      const resolved = await resolveMigrationId(readStoredMigrationId());
-      if (!cancelled && resolved) setMigrationId(resolved);
-    };
-
-    ensureMigration();
-    window.addEventListener('online', ensureMigration);
-    return () => {
-      cancelled = true;
-      window.removeEventListener('online', ensureMigration);
-    };
+  /** Reload the UI from the IndexedDB workspace (the only local source). */
+  const reloadWorkspace = useCallback(async (mid: string) => {
+    setData(await loadWorkspace(mid));
   }, []);
 
-  const firstRun = useRef(true);
+  const retryHydration = useCallback(() => {
+    setHydratedFrom(null);
+    setSyncStatus(SyncManager.isOnline() ? 'READY' : 'OFFLINE');
+    setHydration('LOADING');
+    setMigrationId(getActiveMigrationId());
+    setHydrationToken((token) => token + 1);
+  }, []);
 
-  // ── Outbox sync ────────────────────────────────────────────────────
-  // The draft is the source of truth: every change is diffed into server
-  // operations, queued locally, and pushed (retried until it lands).
-  const dataRef = useRef(data);
-  dataRef.current = data;
-
-  // ── Load the saved inventory from the server ───────────────────────
-  // A device that has never opened this workspace has no local draft, but the
-  // inventory is already in the database. Pull it once per migration, merge it
-  // with any local (possibly unsynced) work, and show all of it.
-  const hydratedFor = useRef<string | null>(null);
+  /**
+   * Hydration. Runs whenever the migration identity changes and is the only
+   * place that decides whether the form may be edited.
+   *
+   * Nothing below may read `data` as "the user's truth" before this resolves —
+   * that is exactly what used to turn an empty list into DELETEs.
+   */
   useEffect(() => {
-    if (!migrationId || hydratedFor.current === migrationId) return;
-    hydratedFor.current = migrationId;
     let cancelled = false;
 
-    (async () => {
-      try {
-        const serverDraft = await fetchServerDraft(migrationId, dataRef.current);
-        if (cancelled || !serverDraft) return;
-        // Mark server-only rows as synced before the draft change triggers a push.
-        await mirrorServerEntities(
-          migrationId,
-          serverDraft.draft,
-          serverDraft.serverOnlyIds,
-          serverDraft.versions
-        );
-        if (cancelled) return;
-        setData((prev) => mergeDraftData(serverDraft.draft, prev));
-        setSyncToken((token) => token + 1);
-      } catch (error) {
-        console.warn('Could not load the saved inventory from the server.', error);
-      }
-    })();
+    const run = async () => {
+      setHydration('LOADING');
+      setData(createInitialData());
 
+      const resolution = await resolveMigrationId();
+      if (cancelled) return;
+
+      if (!resolution.migrationId) {
+        // No identity and no reachable server: show the offline/loading state
+        // instead of pretending the migration is empty.
+        setSyncStatus('OFFLINE');
+        setHydratedFrom('OFFLINE');
+        setHydration('ERROR');
+        return;
+      }
+
+      const id = resolution.migrationId;
+      if (resolution.migrationId !== migrationId) setMigrationId(id);
+
+      try {
+        const result = await hydrateWorkspace(id, { offline: resolution.offline });
+        if (cancelled) return;
+
+        setHydratedFrom(result.source);
+        setSyncStatus(result.offline ? 'OFFLINE' : 'READY');
+
+        if (result.source === 'OFFLINE' && draftIsEmpty(result.data)) {
+          // Nothing local, nothing from the server: this is not an empty
+          // migration, it is an unreachable one.
+          setHydration('ERROR');
+          return;
+        }
+
+        setData(result.data);
+        setHydration('READY');
+        setSetupStatus(draftIsEmpty(result.data) ? 'not_started' : 'in_progress');
+
+        if (result.offline) return;
+
+        // Background sync: push the outbox, then reconcile the server copy.
+        void SyncManager.flushMigration(id).then((summary) => {
+          if (cancelled) return;
+          if (summary.unreachable) setSyncStatus('OFFLINE');
+          else if (summary.errors > 0) setSyncStatus('SYNC_ERROR');
+          return reloadWorkspace(id);
+        });
+      } catch (error) {
+        console.error('Hydration failed', error);
+        if (!cancelled) setHydration('ERROR');
+      }
+    };
+
+    void run();
     return () => {
       cancelled = true;
     };
-  }, [migrationId]);
+    // Intentionally runs for the identity only: hydration must not restart
+    // because React re-rendered. `hydrationToken` is the explicit retry.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [migrationId, hydrationToken, reloadWorkspace]);
 
+  /** Track connectivity so the UI can distinguish offline from failed. */
   useEffect(() => {
-    if (!migrationId) return;
-    const timer = setTimeout(() => {
-      syncDraft(migrationId, data)
-        .then((result) => {
-          if (result.queued > 0 || result.pruned > 0) setSyncToken((token) => token + 1);
+    const goOnline = () => {
+      if (!migrationId) {
+        retryHydration();
+        return;
+      }
+      setSyncStatus('SYNCING');
+      void SyncManager.flushMigration(migrationId)
+        .then((summary) => {
+          setSyncStatus(summary.unreachable ? 'OFFLINE' : summary.errors > 0 ? 'SYNC_ERROR' : 'READY');
+          return reloadWorkspace(migrationId);
         })
-        .catch((error) => console.error('Failed to queue changes for sync', error));
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [data, migrationId]);
-
-  // Coming back online: queue whatever changed while offline, then push. The
-  // pending operations were never discarded, so nothing local is lost.
-  useEffect(() => {
-    if (!migrationId) return;
-    const flush = () => {
-      syncDraft(migrationId, dataRef.current)
-        .then(() => SyncManager.flushMigration(migrationId))
-        .then(() => setSyncToken((token) => token + 1))
-        .catch((error) => console.warn('Sync on reconnect failed', error));
+        .catch(() => setSyncStatus('SYNC_ERROR'));
     };
-    window.addEventListener('online', flush);
-    return () => window.removeEventListener('online', flush);
-  }, [migrationId]);
+    const goOffline = () => setSyncStatus('OFFLINE');
+
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    if (!navigator.onLine) setSyncStatus('OFFLINE');
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
+  }, [migrationId, reloadWorkspace, retryHydration]);
 
   // ── Persistence ────────────────────────────────────────────────────
   useEffect(() => {
     if (!isStorageAvailable()) {
-      setStorageError('Local storage is unavailable in this browser — remember to export your JSON to keep your work.');
-      return;
+      setStorageError('Local storage is unavailable in this browser — you cannot use this form.');
     }
-    if (firstRun.current) {
-      firstRun.current = false;
-      return;
-    }
-    setSaveState('saving');
-    const timer = setTimeout(() => {
-      const result = saveDraft(data);
-      if (result.ok) {
-        setSaveState('saved');
-        setSavedAt(result.savedAt);
-        setStorageError(null);
-      } else {
-        setSaveState('error');
-        setStorageError(result.error);
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [data]);
+  }, []);
 
   useEffect(() => {
     if (storageError) toast.warn(storageError, { toastId: 'storage-error' });
   }, [storageError]);
+
+  /** Every mutation goes through here: one write, one reload from IndexedDB. */
+  const apply = useCallback(
+    async (action: () => Promise<unknown>) => {
+      if (hydration !== 'READY' || !migrationId) return;
+      try {
+        setSyncStatus('SYNCING');
+        await action();
+        await reloadWorkspace(migrationId);
+        // Push right away so the header reflects reality instead of waiting for
+        // the background timer.
+        const summary = await SyncManager.flushMigration(migrationId);
+        await reloadWorkspace(migrationId);
+        setSyncToken((token) => token + 1);
+        setSyncStatus(
+          summary.unreachable ? 'OFFLINE' : summary.errors > 0 ? 'SYNC_ERROR' : 'READY'
+        );
+      } catch (error) {
+        console.error('Local change could not be stored', error);
+        setSyncStatus('SYNC_ERROR');
+        toast.error('That change could not be saved locally. Nothing was lost — please retry.');
+      }
+    },
+    [hydration, migrationId, reloadWorkspace]
+  );
 
   // ── Derived ────────────────────────────────────────────────────────
   const validation = useMemo(() => validateMigration(data), [data]);
@@ -335,33 +274,62 @@ const Home: React.FC = () => {
     [data.openingStock, batchEntryId]
   );
 
-  // ── Catalogue helpers ──────────────────────────────────────────────
-  const createGroup = useCallback((name: string) => {
-    setData((prev) => ({ ...prev, productGroups: addNamed(prev.productGroups, name, (n) => ({ name: n })) }));
-  }, []);
+  const productFor = useCallback(
+    (sku?: string | null) => data.products.find((p) => p.sku === sku),
+    [data.products]
+  );
 
-  const createLocation = useCallback((name: string) => {
-    setData((prev) => ({ ...prev, locations: addNamed(prev.locations, name, (n) => ({ name: n })) }));
-  }, []);
+  const batchFor = useCallback(
+    (sku?: string | null, batchNumber?: string | null) =>
+      data.batches.find((b) => b.productSku === sku && b.batchNumber === batchNumber),
+    [data.batches]
+  );
+
+  // ── Catalogue helpers ──────────────────────────────────────────────
+  const createGroup = useCallback(
+    (name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed || data.productGroups.some((item) => item.name.toLowerCase() === trimmed.toLowerCase())) return;
+      void apply(() => saveGroup(migrationId!, trimmed));
+    },
+    [data.productGroups, migrationId, apply]
+  );
+
+  const createLocation = useCallback(
+    (name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed || data.locations.some((item) => item.name.toLowerCase() === trimmed.toLowerCase())) return;
+      void apply(() => saveLocation(migrationId!, trimmed));
+    },
+    [data.locations, migrationId, apply]
+  );
 
   const createSupplier = useCallback((name: string) => {
-    setData((prev) => ({ ...prev, suppliers: addNamed(prev.suppliers, name, (n) => ({ name: n })) }));
-    // Supplier API might not exist yet based on phase 1, ignore for now
+    const trimmed = name.trim();
+    setData((prev) =>
+      prev.suppliers.some((item) => item.name.toLowerCase() === trimmed.toLowerCase())
+        ? prev
+        : { ...prev, suppliers: [...prev.suppliers, { name: trimmed }] }
+    );
   }, []);
 
-  const createUnit = useCallback((name: string) => {
-    setData((prev) => ({
-      ...prev,
-      units: addNamed(prev.units, name, (n) => ({ name: n, symbol: '' })),
-    }));
-  }, []);
+  const createUnit = useCallback(
+    (name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed || data.units.some((item) => item.name.toLowerCase() === trimmed.toLowerCase())) return;
+      void apply(() => saveUnit(migrationId!, { name: trimmed, symbol: '' }));
+    },
+    [data.units, migrationId, apply]
+  );
 
-  const updateUnitSymbol = useCallback((name: string, symbol: string) => {
-    setData((prev) => ({
-      ...prev,
-      units: prev.units.map((u) => (u.name === name ? { ...u, symbol } : u)),
-    }));
-  }, []);
+  const updateUnitSymbol = useCallback(
+    (name: string, symbol: string) => {
+      const existing = data.units.find((u) => u.name === name);
+      if (!existing) return;
+      void apply(() => saveUnit(migrationId!, { ...existing, symbol }));
+    },
+    [data.units, migrationId, apply]
+  );
 
   // ── Row operations ─────────────────────────────────────────────────
   const handleAddRow = useCallback(() => {
@@ -369,234 +337,203 @@ const Home: React.FC = () => {
       id: newId(),
       productSku: '',
       batchNumber: '',
-      location: '',
+      location: data.locations[0]?.name ?? '',
       quantities: [],
     };
-    setData((prev) => ({
-      ...prev,
-      openingStock: [
-        ...prev.openingStock,
-        { ...entry, location: prev.locations[0]?.name ?? '' },
-      ],
-    }));
-    setFocusEntryId(entry.id);
-  }, []);
-
-  const handleDuplicateRow = useCallback((id: string) => {
-    setData((prev) => {
-      const index = prev.openingStock.findIndex((e) => e.id === id);
-      if (index < 0) return prev;
-      const source = prev.openingStock[index];
-      const copy: StockEntry = {
-        ...source,
-        id: newId(),
-        quantities: source.quantities.map((q) => ({ ...q })),
-      };
-      const openingStock = [...prev.openingStock];
-      openingStock.splice(index + 1, 0, copy);
-      return { ...prev, openingStock };
+    void apply(async () => {
+      await saveStockEntry(migrationId!, entry, undefined, undefined);
+      setFocusEntryId(entry.id);
     });
-  }, []);
+  }, [data.locations, migrationId, apply]);
 
-  const handleDuplicateRows = useCallback((ids: string[]) => {
-    setData((prev) => {
-      const copies: StockEntry[] = [];
-      ids.forEach((id) => {
-        const source = prev.openingStock.find((e) => e.id === id);
-        if (source) {
-          copies.push({ ...source, id: newId(), quantities: source.quantities.map((q) => ({ ...q })) });
+  const duplicateStockEntry = useCallback(
+    (source: StockEntry): StockEntry => ({
+      ...source,
+      id: newId(),
+      quantities: source.quantities.map((q) => ({ ...q })),
+    }),
+    []
+  );
+
+  const handleDuplicateRow = useCallback(
+    (id: string) => {
+      const source = data.openingStock.find((e) => e.id === id);
+      if (!source) return;
+      const copy = duplicateStockEntry(source);
+      void apply(() =>
+        saveStockEntry(migrationId!, copy, productFor(copy.productSku), batchFor(copy.productSku, copy.batchNumber))
+      );
+    },
+    [data.openingStock, duplicateStockEntry, migrationId, productFor, batchFor, apply]
+  );
+
+  const handleDuplicateRows = useCallback(
+    (ids: string[]) => {
+      const copies = ids
+        .map((id) => data.openingStock.find((e) => e.id === id))
+        .filter((entry): entry is StockEntry => Boolean(entry))
+        .map(duplicateStockEntry);
+      if (copies.length === 0) return;
+      void apply(async () => {
+        for (const copy of copies) {
+          await saveStockEntry(
+            migrationId!,
+            copy,
+            productFor(copy.productSku),
+            batchFor(copy.productSku, copy.batchNumber)
+          );
         }
       });
-      return { ...prev, openingStock: [...prev.openingStock, ...copies] };
-    });
-  }, []);
+    },
+    [data.openingStock, duplicateStockEntry, migrationId, productFor, batchFor, apply]
+  );
 
-  const handleDeleteRow = useCallback((id: string) => {
-    setData((prev) => pruneBatches({ ...prev, openingStock: prev.openingStock.filter((e) => e.id !== id) }));
-  }, []);
+  const handleDeleteRow = useCallback(
+    (id: string) => {
+      const entry = data.openingStock.find((e) => e.id === id);
+      if (!entry) return;
+      void apply(() => deleteStockEntry(migrationId!, entry));
+    },
+    [data.openingStock, migrationId, apply]
+  );
 
-  const handleDeleteRows = useCallback((ids: string[]) => {
-    const set = new Set(ids);
-    setData((prev) => pruneBatches({ ...prev, openingStock: prev.openingStock.filter((e) => !set.has(e.id)) }));
-  }, []);
+  const handleDeleteRows = useCallback(
+    (ids: string[]) => {
+      const entries = ids
+        .map((id) => data.openingStock.find((e) => e.id === id))
+        .filter((entry): entry is StockEntry => Boolean(entry));
+      if (entries.length === 0) return;
+      void apply(async () => {
+        for (const entry of entries) {
+          await deleteStockEntry(migrationId!, entry);
+        }
+      });
+    },
+    [data.openingStock, migrationId, apply]
+  );
 
-  const patchEntry = useCallback((id: string, changes: Partial<StockEntry>) => {
-    setData((prev) => ({
-      ...prev,
-      openingStock: prev.openingStock.map((e) => (e.id === id ? { ...e, ...changes } : e)),
-    }));
-  }, []);
+  const persistEntry = useCallback(
+    (entry: StockEntry) =>
+      apply(() =>
+        saveStockEntry(migrationId!, entry, productFor(entry.productSku), batchFor(entry.productSku, entry.batchNumber))
+      ),
+    [migrationId, productFor, batchFor, apply]
+  );
 
-  const setProduct = useCallback((entryId: string, sku: string) => {
-    setData((prev) => {
-      const product = prev.products.find((p) => p.sku === sku);
-      return {
-        ...prev,
-        openingStock: prev.openingStock.map((e) =>
-          e.id === entryId
-            ? {
-                ...e,
-                productSku: sku,
-                batchNumber: sku === e.productSku ? e.batchNumber : '',
-                quantities: sku === e.productSku ? e.quantities : [],
-              }
-            : e
-        ),
-      };
-    });
-  }, []);
+  const patchEntry = useCallback(
+    (id: string, changes: Partial<StockEntry>) => {
+      const entry = data.openingStock.find((e) => e.id === id);
+      if (!entry) return;
+      void persistEntry({ ...entry, ...changes });
+    },
+    [data.openingStock, persistEntry]
+  );
 
-  const setProductGroup = useCallback((sku: string, group: string) => {
-    setData((prev) => ({
-      ...prev,
-      productGroups: addNamed(prev.productGroups, group, (n) => ({ name: n })),
-      products: prev.products.map((p) => (p.sku === sku ? { ...p, productGroup: group } : p)),
-    }));
-  }, []);
+  const setProduct = useCallback(
+    (entryId: string, sku: string) => {
+      const entry = data.openingStock.find((e) => e.id === entryId);
+      if (!entry) return;
+      void persistEntry({
+        ...entry,
+        productSku: sku,
+        batchNumber: sku === entry.productSku ? entry.batchNumber : '',
+        quantities: sku === entry.productSku ? entry.quantities : [],
+      });
+    },
+    [data.openingStock, persistEntry]
+  );
 
-  const upsertBatch = useCallback((batch: Batch) => {
-    setData((prev) => {
-      const exists = prev.batches.some(
-        (b) => b.productSku === batch.productSku && b.batchNumber === batch.batchNumber
-      );
-      const batches = exists
-        ? prev.batches.map((b) =>
-            b.productSku === batch.productSku && b.batchNumber === batch.batchNumber ? batch : b
-          )
-        : [...prev.batches, batch];
-      return { ...prev, batches };
-    });
-  }, []);
+  const setProductGroup = useCallback(
+    (sku: string, group: string) => {
+      const product = data.products.find((p) => p.sku === sku);
+      if (!product) return;
+      void apply(() => saveProduct(migrationId!, { ...product, productGroup: group }));
+    },
+    [data.products, migrationId, apply]
+  );
 
-  const setBatchNumber = useCallback((entryId: string, batchNumber: string) => {
-    patchEntry(entryId, { batchNumber });
-  }, [patchEntry]);
+  const setBatchNumber = useCallback(
+    (entryId: string, batchNumber: string) => {
+      const entry = data.openingStock.find((e) => e.id === entryId);
+      if (!entry) return;
+      void persistEntry({ ...entry, batchNumber });
+    },
+    [data.openingStock, persistEntry]
+  );
 
   const setExpiry = useCallback(
     (entryId: string, expiryDate: string) => {
-      setData((prev) => {
-        const entry = prev.openingStock.find((e) => e.id === entryId);
-        if (!entry || !entry.productSku || !entry.batchNumber) return prev;
-        const key = { productSku: entry.productSku, batchNumber: entry.batchNumber };
-        const existing = prev.batches.find(
-          (b) => b.productSku === key.productSku && b.batchNumber === key.batchNumber
-        );
-        const batch: Batch = existing
-          ? { ...existing, expiryDate }
-          : {
-              ...key,
-              expiryDate,
-              manufacturingDate: null,
-              receivedDate: null,
-              supplier: null,
-              supplierReference: null,
-            };
-        const batches = existing
-          ? prev.batches.map((b) =>
-              b.productSku === key.productSku && b.batchNumber === key.batchNumber ? batch : b
-            )
-          : [...prev.batches, batch];
-        return { ...prev, batches };
+      const entry = data.openingStock.find((e) => e.id === entryId);
+      if (!entry || !entry.productSku || !entry.batchNumber) return;
+      const existing = batchFor(entry.productSku, entry.batchNumber);
+      const batch: Batch = existing
+        ? { ...existing, expiryDate }
+        : {
+            productSku: entry.productSku,
+            batchNumber: entry.batchNumber,
+            expiryDate,
+            manufacturingDate: null,
+            receivedDate: null,
+            supplier: null,
+            supplierReference: null,
+          };
+      void apply(async () => {
+        await saveBatch(migrationId!, batch);
+        // The row may only now be storable on the server.
+        await saveStockEntry(migrationId!, entry, productFor(entry.productSku), batch);
       });
     },
-    []
+    [migrationId, batchFor, productFor, apply]
   );
 
   // ── Product dialog ─────────────────────────────────────────────────
   const handleSaveProduct = useCallback(
-    (product: Product) => {
-      const originalSku = productEditor && productEditor.mode === 'edit' ? productEditor.sku : null;
-      setData((prev) => {
-        let next: MigrationData = { ...prev };
-
-        if (originalSku && originalSku !== product.sku) {
-          next = {
-            ...next,
-            products: next.products.filter((p) => p.sku !== originalSku),
-            openingStock: next.openingStock.map((e) =>
-              e.productSku === originalSku ? { ...e, productSku: product.sku } : e
-            ),
-            batches: next.batches.map((b) =>
-              b.productSku === originalSku ? { ...b, productSku: product.sku } : b
-            ),
-          };
-        }
-
-        const exists = next.products.some((p) => p.sku === product.sku);
-        const products = exists
-          ? next.products.map((p) => (p.sku === product.sku ? product : p))
-          : [...next.products, product];
-
-        // Drop any stock quantities that reference units removed from the product.
-        const validUnits = new Set(product.units.map((u) => u.unit));
-        const openingStock = next.openingStock.map((e) =>
-          e.productSku === product.sku
-            ? { ...e, quantities: e.quantities.filter((q) => validUnits.has(q.unit)) }
-            : e
-        );
-
-        let units = next.units;
-        product.units.forEach((u) => {
-          units = addNamed(units, u.unit, (n) => ({ name: n, symbol: '' }));
-        });
-
-        return {
-          ...next,
-          products,
-          openingStock,
-          units,
-          productGroups: addNamed(next.productGroups, product.productGroup, (n) => ({ name: n })),
-        };
-      });
+    async (product: Product) => {
+      if (!migrationId || hydration !== 'READY') return;
+      await apply(() => saveProduct(migrationId, product));
       setProductEditor(null);
       toast.success(`Product "${product.name}" saved`);
-      // Persistence is handled by the outbox sync effect: it diffs the draft and
-      // queues a parent-first UPSERT for the product and its units.
     },
-    [productEditor]
+    [migrationId, hydration, apply]
   );
 
   // ── Stock / batch dialogs ──────────────────────────────────────────
   const handleSaveStock = useCallback(
-    (quantities: StockQuantity[]) => {
-      if (!stockEntryId) return;
-      patchEntry(stockEntryId, { quantities });
+    async (quantities: StockQuantity[]) => {
+      if (!stockEntryId || !migrationId) return;
+      const entry = data.openingStock.find((e) => e.id === stockEntryId);
+      if (!entry) return;
+      await persistEntry({ ...entry, quantities });
       setStockEntryId(null);
       toast.success('Opening stock updated');
     },
-    [patchEntry, stockEntryId]
+    [stockEntryId, migrationId, data.openingStock, persistEntry]
   );
 
   const handleSaveBatch = useCallback(
-    (batch: Batch) => {
-      if (!batchEntry) return;
-      const original = batchEntry.batchNumber;
-      setData((prev) => {
-        let batches = prev.batches;
-        if (original && original !== batch.batchNumber) {
-          batches = batches.filter(
-            (b) => !(b.productSku === batch.productSku && b.batchNumber === original)
+    async (batch: Batch) => {
+      if (!batchEntry || !migrationId) return;
+      const originalBatchNumber = batchEntry.batchNumber;
+      const renamed = Boolean(originalBatchNumber) && originalBatchNumber !== batch.batchNumber;
+
+      await apply(async () => {
+        await saveBatch(migrationId!, batch);
+        if (renamed) {
+          // A renamed batch is a different server row: retire the old one.
+          await deleteRow(migrationId!, 'BATCH', batchIdFor(migrationId!, batch.productSku, originalBatchNumber));
+          await saveStockEntry(
+            migrationId!,
+            { ...batchEntry, batchNumber: batch.batchNumber },
+            productFor(batch.productSku),
+            batch
           );
         }
-        const exists = batches.some(
-          (b) => b.productSku === batch.productSku && b.batchNumber === batch.batchNumber
-        );
-        batches = exists
-          ? batches.map((b) =>
-              b.productSku === batch.productSku && b.batchNumber === batch.batchNumber ? batch : b
-            )
-          : [...batches, batch];
-
-        const openingStock = prev.openingStock.map((e) =>
-          e.id === batchEntry.id ? { ...e, batchNumber: batch.batchNumber } : e
-        );
-
-        return pruneBatches({ ...prev, batches, openingStock });
       });
+
       setBatchEntryId(null);
       toast.success('Batch details saved');
     },
-    [batchEntry]
+    [batchEntry, migrationId, productFor, apply]
   );
 
   // ── Import / export ────────────────────────────────────────────────
@@ -615,38 +552,38 @@ const Home: React.FC = () => {
     // The export is produced from the server copy, so everything must be pushed first.
     const summary = await SyncManager.flushMigration(migrationId);
     setSyncToken((token) => token + 1);
+    if (summary.unreachable) {
+      setSyncStatus('OFFLINE');
+      toast.error('The migration service is unreachable — your changes are safe on this device and will sync automatically.');
+      return;
+    }
     if (summary.remaining > 0) {
+      setSyncStatus('SYNC_ERROR');
       toast.error(
-        `Cannot export yet: ${summary.remaining} change(s) have not reached the server. Retrying automatically.`
+        `Cannot export yet: ${summary.remaining} change(s) have not reached the server. Resolve the sync issues first.`
       );
       return;
     }
     if (summary.conflicts > 0 || summary.errors > 0) {
+      setSyncStatus('SYNC_ERROR');
       toast.error('Resolve the sync issues before exporting.');
       setConflictsOpen(true);
       return;
     }
 
     try {
-      if (migrationId) {
-        const canonicalJson = await migrationApi.exportMigration(migrationId);
-        const name = `opening-inventory-export-${new Date().toISOString().split('T')[0]}.json`;
-        
-        // Trigger download
-        const blob = new Blob([JSON.stringify(canonicalJson, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = name;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        
-        toast.success(`Exported ${name}`);
-      } else {
-         toast.error("Migration ID not found");
-      }
+      const canonicalJson = await migrationApi.exportMigration(migrationId);
+      const name = `opening-inventory-export-${new Date().toISOString().split('T')[0]}.json`;
+      const blob = new Blob([JSON.stringify(canonicalJson, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success(`Exported ${name}`);
     } catch {
       toast.error('Export failed — could not fetch canonical JSON from server.');
     }
@@ -671,13 +608,19 @@ const Home: React.FC = () => {
     reader.readAsText(file);
   }, []);
 
-  const applyImport = useCallback((imported: MigrationData) => {
-    setData(imported);
-    setPendingImport(null);
-    setStatusFilter('all');
-    setResetFiltersToken((t) => t + 1);
-    toast.success('Migration draft imported — review it before exporting.');
-  }, []);
+  const applyImport = useCallback(
+    (imported: MigrationData) => {
+      if (!migrationId) return;
+      setPendingImport(null);
+      void apply(async () => {
+        const queued = await importMigrationData(migrationId, imported);
+        toast.success(`Imported ${queued} change(s) — review, then export.`);
+      });
+      setStatusFilter('all');
+      setResetFiltersToken((t) => t + 1);
+    },
+    [migrationId, apply]
+  );
 
   const navigateToEntry = useCallback((entryId: string) => {
     setStatusFilter('all');
@@ -686,14 +629,31 @@ const Home: React.FC = () => {
   }, []);
 
   const { counts } = validation;
-  const saveLabel =
-    saveState === 'saving'
-      ? 'Saving…'
-      : saveState === 'error'
-        ? 'Not saved locally'
-        : savedAt
-          ? `Saved locally · ${new Date(savedAt).toLocaleTimeString()}`
-          : 'Saved locally';
+  const { counts: idbCounts } = useOutboxCounts(migrationId, syncToken);
+
+  const statusLabel =
+    hydration === 'LOADING'
+      ? 'Loading existing opening data…'
+      : hydration === 'ERROR'
+        ? 'Waiting for the migration service'
+        : syncStatus === 'OFFLINE'
+          ? 'Offline — changes will sync when the connection returns'
+          : syncStatus === 'SYNC_ERROR'
+            ? 'Sync failed — your local changes are safe'
+            : syncStatus === 'SYNCING'
+              ? 'Saving…'
+              : 'Ready · changes sync automatically';
+
+  const statusDotClass =
+    hydration !== 'READY'
+      ? 'animate-pulse bg-amber-400'
+      : syncStatus === 'OFFLINE'
+        ? 'bg-amber-500'
+        : syncStatus === 'SYNC_ERROR'
+          ? 'bg-destructive'
+          : syncStatus === 'SYNCING'
+            ? 'animate-pulse bg-blue-500'
+            : 'bg-accent';
 
   return (
     <div className="flex min-h-screen flex-col bg-canvas">
@@ -708,16 +668,8 @@ const Home: React.FC = () => {
                 Opening Inventory Setup
               </h1>
               <div className="flex items-center gap-1.5 text-[11px] text-text-muted">
-                <span
-                  className={`h-1.5 w-1.5 rounded-full ${
-                    saveState === 'saving'
-                      ? 'animate-pulse bg-amber-400'
-                      : saveState === 'error'
-                        ? 'bg-destructive'
-                        : 'bg-accent'
-                  }`}
-                />
-                {saveLabel}
+                <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
+                {statusLabel}
               </div>
             </div>
           </div>
@@ -763,81 +715,135 @@ const Home: React.FC = () => {
         </div>
       </header>
 
-      <main className="mx-auto flex w-full max-w-[1500px] flex-1 flex-col gap-4 p-4 sm:p-8">
-        {/* Compact status strip */}
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border border-primary-mid/20 bg-white px-5 py-3 text-sm shadow-sm">
-          <Metric label="Products" value={counts.products} />
-          <Metric label="Stock entries" value={counts.rows} />
-          <Metric label="Valid" value={counts.valid} tone="ok" />
-          <Metric label="Warnings" value={counts.warnings} tone="warn" />
-          <Metric label="Errors" value={counts.errors} tone="bad" />
-          <div className="ml-auto flex items-center gap-4 text-xs">
-            <SyncStatusIndicator
-              migrationId={migrationId}
-              refreshToken={syncToken}
-              onReviewConflicts={() => setConflictsOpen(true)}
+      {hydration === 'LOADING' ? (
+        <main className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-text-secondary">
+          <span className="h-6 w-6 animate-spin rounded-full border-2 border-primary-mid border-t-accent" />
+          <p className="text-sm font-medium">Loading existing opening data...</p>
+          <p className="text-xs text-text-muted">Checking this device first, then the server.</p>
+        </main>
+      ) : hydration === 'ERROR' ? (
+        <main className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
+          <AlertTriangle className="h-8 w-8 text-amber-500" />
+          <p className="text-sm font-medium text-text-primary">
+            {hydratedFrom === 'OFFLINE' || syncStatus === 'OFFLINE'
+              ? 'Offline — the existing opening data could not be loaded.'
+              : 'Failed to load migration data.'}
+          </p>
+          <p className="max-w-md text-xs text-text-muted">
+            {hydratedFrom === 'OFFLINE' || syncStatus === 'OFFLINE'
+              ? 'This device has no local copy and the migration service is unreachable, so an empty form would be misleading. Reconnect and retry — nothing has been changed.'
+              : 'The migration workspace could not be prepared. Retry in a moment.'}
+          </p>
+          <button
+            type="button"
+            onClick={retryHydration}
+            className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white shadow-md transition-colors hover:bg-accent-soft"
+          >
+            Retry
+          </button>
+        </main>
+      ) : (
+        <main className="mx-auto flex w-full max-w-[1500px] flex-1 flex-col gap-4 p-4 sm:p-8">
+          {/* Compact status strip */}
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border border-primary-mid/20 bg-white px-5 py-3 text-sm shadow-sm">
+            <Metric label="Products" value={counts.products} />
+            <Metric label="Stock entries" value={counts.rows} />
+            <Metric label="Valid" value={counts.valid} tone="ok" />
+            <Metric label="Warnings" value={counts.warnings} tone="warn" />
+            <Metric label="Errors" value={counts.errors} tone="bad" />
+            <div className="ml-auto flex items-center gap-4 text-xs">
+              <SyncStatusIndicator
+                migrationId={migrationId}
+                refreshToken={syncToken}
+                syncStatus={syncStatus}
+                pendingCount={idbCounts.pending}
+                conflictCount={idbCounts.conflicts}
+                errorCount={idbCounts.errors}
+                onReviewConflicts={() => setConflictsOpen(true)}
+              />
+              {isStorageAvailable() ? (
+                <div className="flex items-center gap-1">
+                  <HardDriveDownload className="h-3.5 w-3.5 text-accent" />
+                  <span className="text-text-secondary">Saved on this device</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1">
+                  <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
+                  <span className="text-destructive">Local storage unavailable</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {syncStatus === 'OFFLINE' && (
+            <div className="flex items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2.5 text-sm text-amber-800">
+              <AlertTriangle className="h-4 w-4" />
+              <span>
+                Offline — {idbCounts.pending > 0 ? `${idbCounts.pending} change(s) will sync when the connection returns.` : 'your saved changes are safe on this device.'}
+              </span>
+            </div>
+          )}
+
+          {syncStatus === 'SYNC_ERROR' && (
+            <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-2.5 text-sm text-destructive">
+              <AlertTriangle className="h-4 w-4" />
+              <span>
+                Sync failed — your local changes are still safe.{' '}
+                <button type="button" onClick={() => setConflictsOpen(true)} className="font-semibold underline">
+                  Retry
+                </button>
+              </span>
+            </div>
+          )}
+
+          {validation.errors.length > 0 && (
+            <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                {validation.errors.length} blocking error(s) — export is disabled until they are fixed.{' '}
+                <button type="button" onClick={() => setReviewOpen(true)} className="font-semibold underline">
+                  Review now
+                </button>
+              </span>
+            </div>
+          )}
+
+          {validation.errors.length === 0 && counts.rows > 0 && (
+            <div className="flex items-center gap-2 rounded-lg border border-primary-mid/30 bg-primary-light/40 px-4 py-2.5 text-sm text-accent">
+              <CheckCircle className="h-4 w-4" />
+              <span>All rows are valid — ready to export.</span>
+            </div>
+          )}
+
+          <div className="min-h-[560px] flex-1">
+            <InventoryTable
+              data={data}
+              validation={validation}
+              statusFilter={statusFilter}
+              onStatusFilterChange={setStatusFilter}
+              focusEntryId={focusEntryId}
+              onFocusHandled={() => setFocusEntryId(null)}
+              resetFiltersToken={resetFiltersToken}
+              onUpdateStock={(entry) => setStockEntryId(entry.id)}
+              onAddRow={handleAddRow}
+              onAddProduct={() => setProductEditor({ mode: 'new' })}
+              onDuplicateRow={handleDuplicateRow}
+              onDeleteRow={handleDeleteRow}
+              onDuplicateRows={handleDuplicateRows}
+              onDeleteRows={handleDeleteRows}
+              onEditProduct={(sku) => setProductEditor(sku ? { mode: 'edit', sku } : { mode: 'new' })}
+              onOpenBatch={(entryId) => setBatchEntryId(entryId)}
+              onSetProduct={setProduct}
+              onSetBatchNumber={setBatchNumber}
+              onSetExpiry={setExpiry}
+              onSetLocation={(entryId, location) => patchEntry(entryId, { location })}
+              onSetProductGroup={setProductGroup}
+              onCreateGroup={createGroup}
+              onCreateLocation={createLocation}
             />
-            {isStorageAvailable() ? (
-              <div className="flex items-center gap-1">
-                <HardDriveDownload className="h-3.5 w-3.5 text-accent" />
-                <span className="text-text-secondary">Draft auto-saves</span>
-              </div>
-            ) : (
-              <div className="flex items-center gap-1">
-                <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
-                <span className="text-destructive">Local storage unavailable</span>
-              </div>
-            )}
           </div>
-        </div>
-
-        {validation.errors.length > 0 && (
-          <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span>
-              {validation.errors.length} blocking error(s) — export is disabled until they are fixed.{' '}
-              <button type="button" onClick={() => setReviewOpen(true)} className="font-semibold underline">
-                Review now
-              </button>
-            </span>
-          </div>
-        )}
-
-        {validation.errors.length === 0 && counts.rows > 0 && (
-          <div className="flex items-center gap-2 rounded-lg border border-primary-mid/30 bg-primary-light/40 px-4 py-2.5 text-sm text-accent">
-            <CheckCircle className="h-4 w-4" />
-            <span>All rows are valid — ready to export.</span>
-          </div>
-        )}
-
-        <div className="min-h-[560px] flex-1">
-          <InventoryTable
-            data={data}
-            validation={validation}
-            statusFilter={statusFilter}
-            onStatusFilterChange={setStatusFilter}
-            focusEntryId={focusEntryId}
-            onFocusHandled={() => setFocusEntryId(null)}
-            resetFiltersToken={resetFiltersToken}
-            onUpdateStock={(entry) => setStockEntryId(entry.id)}
-            onAddRow={handleAddRow}
-            onAddProduct={() => setProductEditor({ mode: 'new' })}
-            onDuplicateRow={handleDuplicateRow}
-            onDeleteRow={handleDeleteRow}
-            onDuplicateRows={handleDuplicateRows}
-            onDeleteRows={handleDeleteRows}
-            onEditProduct={(sku) => setProductEditor(sku ? { mode: 'edit', sku } : { mode: 'new' })}
-            onOpenBatch={(entryId) => setBatchEntryId(entryId)}
-            onSetProduct={setProduct}
-            onSetBatchNumber={setBatchNumber}
-            onSetExpiry={setExpiry}
-            onSetLocation={(entryId, location) => patchEntry(entryId, { location })}
-            onSetProductGroup={setProductGroup}
-            onCreateGroup={createGroup}
-            onCreateLocation={createLocation}
-          />
-        </div>
-      </main>
+        </main>
+      )}
 
       <footer className="border-t border-primary-mid/20 bg-primary-light/30 px-4 py-3 sm:px-8">
         <div className="mx-auto flex max-w-[1500px] flex-wrap items-center justify-between gap-2 text-[11px] text-text-secondary">
@@ -864,21 +870,19 @@ const Home: React.FC = () => {
         />
       )}
 
-      {stockEntry && stockEntry.productSku && data.products.find((p) => p.sku === stockEntry.productSku) && (
+      {stockEntry && stockEntry.productSku && productFor(stockEntry.productSku) && (
         <StockDialog
-          product={data.products.find((p) => p.sku === stockEntry.productSku) as Product}
+          product={productFor(stockEntry.productSku) as Product}
           entry={stockEntry}
           onSave={handleSaveStock}
           onClose={() => setStockEntryId(null)}
         />
       )}
 
-      {batchEntry && batchEntry.productSku && data.products.find((p) => p.sku === batchEntry.productSku) && (
+      {batchEntry && batchEntry.productSku && productFor(batchEntry.productSku) && (
         <BatchDialog
-          product={data.products.find((p) => p.sku === batchEntry.productSku) as Product}
-          batch={data.batches.find(
-            (b) => b.productSku === batchEntry.productSku && b.batchNumber === batchEntry.batchNumber
-          )}
+          product={productFor(batchEntry.productSku) as Product}
+          batch={batchFor(batchEntry.productSku, batchEntry.batchNumber)}
           initialBatchNumber={batchEntry.batchNumber}
           suppliers={data.suppliers.map((s) => s.name)}
           onCreateSupplier={createSupplier}
@@ -898,10 +902,7 @@ const Home: React.FC = () => {
       )}
 
       {conflictsOpen && migrationId && (
-        <ConflictDialog 
-          migrationId={migrationId}
-          onClose={() => setConflictsOpen(false)}
-        />
+        <ConflictDialog migrationId={migrationId} onClose={() => setConflictsOpen(false)} />
       )}
 
       {pendingImport && (
@@ -922,6 +923,30 @@ const Home: React.FC = () => {
     </div>
   );
 };
+
+/** Poll the outbox so the indicator reflects queued work without a re-render storm. */
+function useOutboxCounts(migrationId: string | null, refreshToken: number) {
+  const [counts, setCounts] = useState({ pending: 0, conflicts: 0, errors: 0 });
+
+  useEffect(() => {
+    if (!migrationId) return;
+    let cancelled = false;
+
+    const read = async () => {
+      const next = await OperationQueue.counts(migrationId);
+      if (!cancelled) setCounts(next);
+    };
+
+    void read();
+    const interval = setInterval(read, 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [migrationId, refreshToken]);
+
+  return { counts };
+}
 
 const Metric: React.FC<{ label: string; value: number; tone?: 'ok' | 'warn' | 'bad' }> = ({
   label,

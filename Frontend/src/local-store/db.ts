@@ -1,4 +1,4 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { deleteDB, openDB, type DBSchema, type IDBPDatabase } from 'idb';
 
 export interface MigrationDB extends DBSchema {
   migrations: {
@@ -56,6 +56,8 @@ export interface MigrationDB extends DBSchema {
       status: 'PENDING' | 'SYNCING' | 'FAILED' | 'CONFLICT' | 'ERROR';
       retryCount: number;
       lastError?: string;
+      /** When this run claimed the operation; used to reclaim abandoned work. */
+      claimedAt?: number;
     };
     indexes: { 'by-migration': string; 'by-status': string };
   };
@@ -107,4 +109,17 @@ export function getDB() {
     });
   }
   return dbPromise;
+}
+
+/**
+ * Drop the local workspace entirely.
+ *
+ * Used by the "start a migration from scratch" path and by the test suite, which
+ * needs each case to begin with an empty device.
+ */
+export async function resetDB(): Promise<void> {
+  const db = await getDB();
+  db.close();
+  dbPromise = null;
+  await deleteDB(DB_NAME);
 }
