@@ -8,7 +8,9 @@ router.get('/', async (req, res) => {
         const { migrationId } = (req.params as any);
         const stocks = await prisma.openingStock.findMany({
             where: { migrationId },
-            include: { batch: true, location: true, product: true }
+            include: { batch: true, location: true, product: true },
+            // Form order, so a duplicated line comes back below its original.
+            orderBy: [{ position: 'asc' }, { createdAt: 'asc' }]
         });
         res.json(stocks);
     } catch (error) {
@@ -19,11 +21,14 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
     try {
         const { migrationId } = (req.params as any);
-        const { productId, batchId, locationId, unitBreakdown, unitCost } = req.body;
+        const { productId, batchId, locationId, unitBreakdown, unitCost, lineKey, position } = req.body;
 
         if (!productId || !batchId || !locationId || !Array.isArray(unitBreakdown)) {
             return res.status(400).json({ error: 'Missing required fields or invalid unitBreakdown' });
         }
+
+        // Distinguishes two otherwise identical lines; omit it for an ordinary one.
+        const stockLineKey = typeof lineKey === 'string' ? lineKey : '';
 
         const product = await prisma.product.findUnique({ where: { id: productId, migrationId } });
         const batch = await prisma.batch.findUnique({ where: { id: batchId, migrationId } });
@@ -49,12 +54,21 @@ router.post('/', async (req, res) => {
             baseQuantity += quantity * unitMap.get(unitId)!;
         }
 
+        // A (batch, location) pair may hold several lines as long as each has its
+        // own line key — that is what a duplicated row is.
         const existing = await prisma.openingStock.findUnique({
-            where: { migrationId_batchId_locationId: { migrationId, batchId, locationId } }
+            where: {
+                migrationId_batchId_locationId_lineKey: {
+                    migrationId,
+                    batchId,
+                    locationId,
+                    lineKey: stockLineKey
+                }
+            }
         });
 
         if (existing) {
-            return res.status(409).json({ error: 'Stock already exists for this batch and location' });
+            return res.status(409).json({ error: 'Stock already exists for this batch, location and line' });
         }
 
         const stock = await prisma.openingStock.create({
@@ -63,6 +77,8 @@ router.post('/', async (req, res) => {
                 productId,
                 batchId,
                 locationId,
+                lineKey: stockLineKey,
+                position: typeof position === 'number' && Number.isFinite(position) ? position : 0,
                 baseQuantity,
                 unitBreakdown,
                 unitCost: unitCost || 0

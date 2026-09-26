@@ -7,6 +7,7 @@ import {
   CheckCircle,
   ListChecks,
   HardDriveDownload,
+  RefreshCw,
 } from 'lucide-react';
 import { toast } from 'react-toastify';
 import type {
@@ -32,7 +33,9 @@ import { OperationQueue } from '../sync/queue';
 import {
   deleteRow,
   deleteStockEntry,
+  duplicateStockEntry,
   importMigrationData,
+  nextStockPosition,
   saveBatch,
   saveGroup,
   saveLocation,
@@ -103,6 +106,8 @@ const Home: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [focusEntryId, setFocusEntryId] = useState<string | null>(null);
   const [resetFiltersToken, setResetFiltersToken] = useState(0);
+  /** True while the user-requested full sync is running, to disable the button. */
+  const [syncingNow, setSyncingNow] = useState(false);
 
   // ── Server migration identity ──────────────────────────────────────
   const [migrationId, setMigrationId] = useState<string | null>(getActiveMigrationId);
@@ -219,6 +224,71 @@ const Home: React.FC = () => {
       window.removeEventListener('offline', goOffline);
     };
   }, [migrationId, reloadWorkspace, retryHydration]);
+
+  // ── Manual sync ────────────────────────────────────────────────────
+  /**
+   * "Sync Latest Data": push everything owed to the server, then rebuild the
+   * local cache from its complete state.
+   *
+   * The three outcomes are reported separately because they need different
+   * reactions: unreachable means "you are offline, your work is safe", whereas
+   * rejected changes mean "the server did not accept something and needs a look".
+   */
+  const handleSyncLatest = useCallback(async () => {
+    if (!migrationId || syncingNow) return;
+
+    setSyncingNow(true);
+    setSyncStatus('SYNCING');
+    const toastId = toast.loading('Syncing data...');
+
+    try {
+      const summary = await SyncManager.syncNow(migrationId);
+      await reloadWorkspace(migrationId);
+      setSyncToken((token) => token + 1);
+
+      if (summary.unreachable) {
+        setSyncStatus('OFFLINE');
+        toast.update(toastId, {
+          render: 'Failed to sync. Offline mode active.',
+          type: 'error',
+          isLoading: false,
+          autoClose: 6000,
+        });
+        return;
+      }
+
+      setSyncStatus(summary.errors > 0 || summary.conflicts > 0 ? 'SYNC_ERROR' : 'READY');
+
+      if (summary.errors > 0) {
+        toast.update(toastId, {
+          render: `Synced, but ${summary.errors} change${summary.errors === 1 ? '' : 's'} could not be applied. Open Sync Status for details.`,
+          type: 'error',
+          isLoading: false,
+          autoClose: 8000,
+        });
+        return;
+      }
+
+      const pushed = summary.synced > 0 ? ` · ${summary.synced} sent` : '';
+      toast.update(toastId, {
+        render: `Data synchronized successfully${pushed}.`,
+        type: 'success',
+        isLoading: false,
+        autoClose: 4000,
+      });
+    } catch (error) {
+      console.error('Manual sync failed', error);
+      setSyncStatus('SYNC_ERROR');
+      toast.update(toastId, {
+        render: 'Failed to sync. Your local changes are safe — please retry.',
+        type: 'error',
+        isLoading: false,
+        autoClose: 8000,
+      });
+    } finally {
+      setSyncingNow(false);
+    }
+  }, [migrationId, syncingNow, reloadWorkspace]);
 
   // ── Persistence ────────────────────────────────────────────────────
   useEffect(() => {
@@ -339,41 +409,38 @@ const Home: React.FC = () => {
       batchNumber: '',
       location: data.locations[0]?.name ?? '',
       quantities: [],
+      // New lines go to the bottom; duplicates take a slot between two rows.
+      position: nextStockPosition(data.openingStock),
     };
     void apply(async () => {
       await saveStockEntry(migrationId!, entry, undefined, undefined);
       setFocusEntryId(entry.id);
     });
-  }, [data.locations, migrationId, apply]);
+  }, [data.locations, data.openingStock, migrationId, apply]);
 
-  const duplicateStockEntry = useCallback(
-    (source: StockEntry): StockEntry => ({
-      ...source,
-      id: newId(),
-      quantities: source.quantities.map((q) => ({ ...q })),
-    }),
-    []
-  );
-
-  const handleDuplicateRow = useCallback(
-    (id: string) => {
-      const source = data.openingStock.find((e) => e.id === id);
-      if (!source) return;
-      const copy = duplicateStockEntry(source);
-      void apply(() =>
-        saveStockEntry(migrationId!, copy, productFor(copy.productSku), batchFor(copy.productSku, copy.batchNumber))
-      );
-    },
-    [data.openingStock, duplicateStockEntry, migrationId, productFor, batchFor, apply]
-  );
-
-  const handleDuplicateRows = useCallback(
+  /**
+   * Copy one or more lines.
+   *
+   * The copy is a separate row in IndexedDB with its own business key, so it is
+   * inserted rather than merged into the original, and it is queued like any other
+   * edit — which means it reaches PostgreSQL now when online and later when not.
+   */
+  const duplicateEntries = useCallback(
     (ids: string[]) => {
-      const copies = ids
-        .map((id) => data.openingStock.find((e) => e.id === id))
-        .filter((entry): entry is StockEntry => Boolean(entry))
-        .map(duplicateStockEntry);
-      if (copies.length === 0) return;
+      const sources = ids
+        .map((id) => data.openingStock.find((entry) => entry.id === id))
+        .filter((entry): entry is StockEntry => Boolean(entry));
+      if (sources.length === 0) return;
+
+      // Each copy is placed against the list as it stands, so duplicates of
+      // several lines do not all target the same gap.
+      const placed = [...data.openingStock];
+      const copies = sources.map((source) => {
+        const copy = duplicateStockEntry(source, placed);
+        placed.push(copy);
+        return copy;
+      });
+
       void apply(async () => {
         for (const copy of copies) {
           await saveStockEntry(
@@ -383,9 +450,26 @@ const Home: React.FC = () => {
             batchFor(copy.productSku, copy.batchNumber)
           );
         }
+        setFocusEntryId(copies[copies.length - 1].id);
       });
+
+      toast.success(
+        copies.length === 1
+          ? 'Row duplicated. The copy is directly below the original.'
+          : `${copies.length} rows duplicated.`
+      );
     },
-    [data.openingStock, duplicateStockEntry, migrationId, productFor, batchFor, apply]
+    [data.openingStock, migrationId, productFor, batchFor, apply]
+  );
+
+  const handleDuplicateRow = useCallback(
+    (id: string) => duplicateEntries([id]),
+    [duplicateEntries]
+  );
+
+  const handleDuplicateRows = useCallback(
+    (ids: string[]) => duplicateEntries(ids),
+    [duplicateEntries]
   );
 
   const handleDeleteRow = useCallback(
@@ -675,6 +759,24 @@ const Home: React.FC = () => {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleSyncLatest}
+              disabled={!migrationId || syncingNow || hydration !== 'READY'}
+              title={
+                hydration !== 'READY'
+                  ? 'Wait for the workspace to finish loading'
+                  : 'Fetch the latest records from the server and refresh this device'
+              }
+              className="flex items-center gap-2 rounded-lg border border-primary-mid/40 px-3.5 py-2 text-sm font-medium text-text-secondary transition-colors hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {syncingNow ? (
+                <span className="h-4 w-4 animate-spin rounded-full border-2 border-primary-mid border-t-accent" />
+              ) : (
+                <RefreshCw className="h-4 w-4" />
+              )}
+              Sync Latest Data
+            </button>
             <button
               type="button"
               onClick={() => setReviewOpen(true)}

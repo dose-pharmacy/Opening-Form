@@ -179,12 +179,18 @@ router.get('/:id/changes', async (req, res) => {
     }
 
     if (migration.revision <= sinceRevision) {
-      // Same shape as the full response below, just empty: a caller can always
-      // read `state` without having to check which branch it got.
+      // Same shape as the full response below, just empty, plus an explicit
+      // `fullState: false`.
+      //
+      // That flag is what lets the client tell "the server is up to date with me"
+      // apart from "here is everything the server has". Only the second case
+      // authorises deleting local rows the payload does not mention — treating the
+      // first case as authoritative would wipe the whole local workspace.
       return res.json({
         migrationId: id,
         fromRevision: sinceRevision,
         toRevision: migration.revision,
+        fullState: false,
         state: {
           groups: [],
           locations: [],
@@ -204,13 +210,18 @@ router.get('/:id/changes', async (req, res) => {
       prisma.product.findMany({ where: { migrationId: id } }),
       prisma.productUnit.findMany({ where: { product: { migrationId: id } } }),
       prisma.batch.findMany({ where: { migrationId: id } }),
-      prisma.openingStock.findMany({ where: { migrationId: id } }),
+      // Position is what puts a duplicated line back under its original, so the
+      // payload has to arrive in the order the user sees.
+      prisma.openingStock.findMany({ where: { migrationId: id }, orderBy: { position: 'asc' } }),
     ]);
 
     res.json({
       migrationId: id,
       fromRevision: sinceRevision,
       toRevision: migration.revision,
+      // Everything the server holds for this migration: the client may treat a
+      // local row missing from this payload as deleted.
+      fullState: true,
       state: {
         groups,
         locations,
@@ -247,7 +258,7 @@ router.get('/:id/export', async (req, res) => {
       prisma.product.findMany({ where: { migrationId: id }, orderBy: { sku: 'asc' } }),
       prisma.productUnit.findMany({ where: { product: { migrationId: id } } }),
       prisma.batch.findMany({ where: { migrationId: id }, orderBy: [ { productId: 'asc' }, { batchNumber: 'asc' }] }),
-      prisma.openingStock.findMany({ where: { migrationId: id } }),
+      prisma.openingStock.findMany({ where: { migrationId: id }, orderBy: { position: 'asc' } }),
     ]);
 
     // Validation to prevent export if there are errors would ideally happen here too,
@@ -322,14 +333,18 @@ router.get('/:id/export', async (req, res) => {
              }
          } catch (e) {}
 
-         return {
-           productSku: p?.sku ?? '',
-           batchNumber: b?.batchNumber ?? '',
-           location: l?.name ?? '',
-           baseQuantity: os.baseQuantity,
-           unitCost: os.unitCost,
-           quantities
-         };
+          return {
+            productSku: p?.sku ?? '',
+            batchNumber: b?.batchNumber ?? '',
+            location: l?.name ?? '',
+            baseQuantity: os.baseQuantity,
+            unitCost: os.unitCost,
+            // Carried so a re-import can tell two identical lines apart and put
+            // them back in the same order.
+            lineKey: os.lineKey ?? '',
+            position: os.position ?? 0,
+            quantities
+          };
       })
     };
 

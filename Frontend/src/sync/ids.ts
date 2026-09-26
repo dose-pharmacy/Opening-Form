@@ -36,5 +36,29 @@ export const productUnitId = (migrationId: string, sku: string, unit: string) =>
   sid(migrationId, 'productunit', `${sku}::${unit}`);
 export const batchId = (migrationId: string, sku: string, batchNumber: string) =>
   sid(migrationId, 'batch', `${sku}::${batchNumber}`);
-export const stockId = (migrationId: string, sku: string, batchNumber: string, location: string) =>
-  sid(migrationId, 'stock', `${sku}::${batchNumber}::${location}`);
+/**
+ * Identity of an opening-stock line.
+ *
+ * A line is identified by product, batch and location — but a (batch, location)
+ * pair may legitimately hold more than one line, because "Duplicate row" copies a
+ * line verbatim. `lineKey` is what separates them: empty for an ordinary line, and
+ * unique per copy for a duplicated one.
+ *
+ * The key is part of the derived id so two identical lines get two different rows
+ * in IndexedDB *and* two different rows in PostgreSQL, instead of the second
+ * write silently replacing the first.
+ *
+ * An empty line key deliberately produces the historical id, so rows written
+ * before duplicates existed keep the identity they were stored under.
+ */
+export const stockId = (
+  migrationId: string,
+  sku: string,
+  batchNumber: string,
+  location: string,
+  lineKey = ''
+) => {
+  const base = `${sku}::${batchNumber}::${location}`;
+  const key = lineKey.trim();
+  return sid(migrationId, 'stock', key ? `${base}::${key}` : base);
+};

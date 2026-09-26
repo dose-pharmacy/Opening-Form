@@ -84,7 +84,16 @@ interface Catalogue {
 
 const productUnitKey = (productId: string, unitId: string) => `${productId}::${unitId}`;
 const batchKey = (productId: string, batchNumber: string) => `${productId}::${batchNumber}`;
-const stockKey = (batchId: string, locationId: string) => `${batchId}::${locationId}`;
+/**
+ * A stock line's business key.
+ *
+ * `lineKey` is part of it, which is what allows two identical lines to coexist:
+ * "Duplicate row" copies a line and gives the copy its own key, so the copy is a
+ * new row instead of an update of the original. Ordinary lines carry an empty
+ * key, so their identity is unchanged from before.
+ */
+const stockKey = (batchId: string, locationId: string, lineKey: unknown = '') =>
+  `${batchId}::${locationId}::${typeof lineKey === 'string' ? lineKey : ''}`;
 
 type StoreKey =
   | 'groups'
@@ -188,7 +197,7 @@ async function loadCatalogue(migrationId: string, needed: Set<StoreKey>): Promis
   });
   openingStocks.forEach((row) => {
     catalogue.openingStocks.set(row.id, row);
-    catalogue.openingStocksByKey.set(stockKey(row.batchId, row.locationId), row);
+    catalogue.openingStocksByKey.set(stockKey(row.batchId, row.locationId, row.lineKey), row);
   });
 
   return catalogue;
@@ -222,7 +231,7 @@ const indexRow = (catalogue: Catalogue, store: string, row: AnyRow) => {
       break;
     case 'openingStock':
       catalogue.openingStocks.set(row.id, row);
-      catalogue.openingStocksByKey.set(stockKey(row.batchId, row.locationId), row);
+      catalogue.openingStocksByKey.set(stockKey(row.batchId, row.locationId, row.lineKey), row);
       break;
     default:
       break;
@@ -265,7 +274,7 @@ const unindexRow = (catalogue: Catalogue, store: string, row: AnyRow) => {
       break;
     case 'openingStock':
       catalogue.openingStocks.delete(row.id);
-      catalogue.openingStocksByKey.delete(stockKey(row.batchId, row.locationId));
+      catalogue.openingStocksByKey.delete(stockKey(row.batchId, row.locationId, row.lineKey));
       break;
     default:
       break;
@@ -415,6 +424,10 @@ const ENTITIES: Record<EntityType, EntityDefinition> = {
       productId: '',
       batchId: '',
       locationId: '',
+      // Identity of the line within its (batch, location) pair, and where it sits
+      // in the form. Both are part of the row, so two identical lines are two rows.
+      lineKey: optionalText(payload.lineKey) ?? '',
+      position: numberOr(payload.position, 0),
     }),
     resolve: (catalogue, data, payload) => {
       const product =
@@ -481,7 +494,7 @@ const ENTITIES: Record<EntityType, EntityDefinition> = {
       data.baseQuantity = baseQuantity;
     },
     byId: (c, id) => c.openingStocks.get(id),
-    byKey: (c, data) => c.openingStocksByKey.get(stockKey(data.batchId, data.locationId)),
+    byKey: (c, data) => c.openingStocksByKey.get(stockKey(data.batchId, data.locationId, data.lineKey)),
   },
 };
 

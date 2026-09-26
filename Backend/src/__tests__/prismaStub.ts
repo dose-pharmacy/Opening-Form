@@ -173,13 +173,32 @@ export function createPrismaStub(options: StubOptions = {}) {
 
   for (const name of ['productGroup', 'location', 'unit', 'product', 'productUnit', 'batch', 'openingStock']) {
     const table = tables[name];
-    delegates[name] = {
+    const delegate: Record<string, any> = {
       findMany: (args: any) => table.findMany(args),
       findUnique: (args: any) => table.findUnique(args),
       create: (args: any) => guard(name, 'create', args.data.id, () => table.create(args)),
       update: (args: any) => guard(name, 'update', args.where.id, () => table.update(args)),
       delete: (args: any) => guard(name, 'delete', args.where.id, () => table.delete(args)),
     };
+
+    // `where: { product: { migrationId } }` is how the route scopes units and
+    // stock to a migration, so products have to be indexed by migration for that
+    // filter to mean anything.
+    if (name === 'product') {
+      const remember = async (args: any) => {
+        const row = await guard(name, 'create', args.data.id, () => table.create(args));
+        productIdsByMigration.set(row.id, row.migrationId);
+        return row;
+      };
+      delegate.create = remember;
+      delegate.update = async (args: any) => {
+        const row = await guard(name, 'update', args.where.id, () => table.update(args));
+        productIdsByMigration.set(row.id, row.migrationId);
+        return row;
+      };
+    }
+
+    delegates[name] = delegate;
   }
 
   return {

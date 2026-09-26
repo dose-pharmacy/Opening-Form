@@ -233,9 +233,18 @@ export function buildMigrationData(rows: LocalRowSets): MigrationData {
       productSku,
       batchNumber: text(row.batchNumber ?? batchNumbers.get(batchId)),
       location: text(row.location ?? row.locationName ?? locationNames.get(text(row.locationId))),
+      // Identity and placement survive the round-trip, so a duplicated line stays
+      // a separate row below its original across reloads and on every device.
+      lineKey: optionalText(row.lineKey) ?? '',
+      position: number(row.position, 0),
       quantities,
     };
   });
+
+  // Form order. `position` is authoritative; rows written before positions existed
+  // all sit at 0, so the stored order is kept for them (Array#sort is stable) and
+  // they end up ahead of anything explicitly positioned.
+  openingStock.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
 
   return {
     schemaVersion: SCHEMA_VERSION,

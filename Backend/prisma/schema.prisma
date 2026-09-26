@@ -145,6 +145,13 @@ model OpeningStock {
   productId     String
   batchId       String
   locationId    String
+  /// Distinguishes two otherwise identical lines. Empty for an ordinary line, so
+  /// a single (batch, location) pair still behaves exactly as before; a duplicated
+  /// line gets its own key and is therefore a row of its own.
+  lineKey       String   @default("")
+  /// Sort position within the form, so a duplicate can sit directly below the row
+  /// it was copied from and survive a reload.
+  position      Float    @default(0)
   baseQuantity  Float
   unitBreakdown Json     // e.g., [{ unitId, quantity }]
   unitCost      Float    @default(0)
@@ -156,7 +163,8 @@ model OpeningStock {
   batch         Batch     @relation(fields: [batchId], references: [id])
   location      Location  @relation(fields: [locationId], references: [id])
 
-  @@unique([migrationId, batchId, locationId])
+  @@unique([migrationId, batchId, locationId, lineKey])
+  @@index([migrationId, position])
 }
 
 model ProcessedOperation {

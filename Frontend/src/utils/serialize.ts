@@ -69,6 +69,10 @@ export function buildExportPayload(data: MigrationData): Record<string, unknown>
       productSku: entry.productSku,
       batchNumber: entry.batchNumber,
       location: entry.location,
+      // Identity and order of the line: without these a re-import would collapse
+      // two duplicated lines into one.
+      lineKey: entry.lineKey ?? '',
+      position: Number(entry.position) || 0,
       quantities: entry.quantities
         .filter((q) => q.unit)
         .map((q) => ({
@@ -201,6 +205,8 @@ export function normalizeMigration(raw: unknown): MigrationData {
       productSku: asString(e.productSku),
       batchNumber: asString(e.batchNumber),
       location: asString(e.location),
+      lineKey: asString(e.lineKey),
+      position: asNumber(e.position, 0),
       quantities: quantities.filter((q) => q.unit),
     };
   });

@@ -47,6 +47,14 @@ export const ALL_STORES: EntityStore[] = [
   'openingStock',
 ];
 
+/** The inverse of `STORE_FOR_ENTITY`, derived so the two can never drift apart. */
+export const ENTITY_FOR_STORE: Record<EntityStore, EntityType> = Object.fromEntries(
+  (Object.keys(STORE_FOR_ENTITY) as EntityType[]).map((entityType) => [
+    STORE_FOR_ENTITY[entityType],
+    entityType,
+  ])
+) as Record<EntityStore, EntityType>;
+
 export type SyncState = 'SYNCED' | 'CREATED_LOCALLY' | 'UPDATED_LOCALLY' | 'DELETED_LOCALLY' | 'SYNC_ERROR';
 
 /** Local, unsynced intent. Rows in these states are never overwritten by a pull. */
@@ -139,6 +147,51 @@ export async function hasLocalWorkspace(migrationId: string): Promise<boolean> {
     if ((await countLocalRows(store, migrationId)) > 0) return true;
   }
   return false;
+}
+
+/**
+ * Drop local rows the server no longer has.
+ *
+ * PostgreSQL is the source of truth, so a row that is missing from an
+ * *authoritative* server snapshot was deleted on the server and must not linger
+ * in IndexedDB. This is what stops one device from showing a record another
+ * device removed.
+ *
+ * The rule is deliberately narrow, because the alternative — deleting anything
+ * the payload does not mention — is how a partial or failed response wipes a
+ * user's unsynced work. A row is only removed when all of these hold:
+ *  - the snapshot was the complete server state (`authoritative`);
+ *  - the row carries no pending local intent and the outbox does not own it;
+ *  - the row is not a tombstone (a queued delete owns it);
+ *  - the row has been confirmed by the server at least once (`SYNCED`).
+ *
+ * Returns the ids that were removed.
+ */
+export async function pruneLocalRows(
+  store: EntityStore,
+  migrationId: string,
+  serverIds: Set<string>,
+  options: { pendingEntityIds?: Set<string>; authoritative?: boolean } = {}
+): Promise<string[]> {
+  if (options.authoritative === false) return [];
+
+  const { pendingEntityIds = new Set<string>() } = options;
+  const rows = await getRawRows(store, migrationId);
+  const removed: string[] = [];
+
+  for (const row of rows) {
+    if (serverIds.has(row.id)) continue;
+    if (isPending(row)) continue;
+    if (isTombstone(row)) continue;
+    if (pendingEntityIds.has(row.id)) continue;
+    // Only a row the server has confirmed can be *deleted* by the server's
+    // silence. A row that never reached it is this device's own unsynced work.
+    if (row.syncState !== 'SYNCED') continue;
+
+    await deleteLocalEntity(ENTITY_FOR_STORE[store], row.id);    removed.push(row.id);
+  }
+
+  return removed;
 }
 
 /**

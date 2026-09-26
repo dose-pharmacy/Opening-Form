@@ -12,15 +12,17 @@
 import { getDB } from '../local-store/db';
 import {
   ALL_STORES,
+  ENTITY_FOR_STORE,
   STORE_FOR_ENTITY,
   clearTombstone,
   isPending,
   isTombstone,
   markEntitySynced,
   markEntitySyncError,
+  pruneLocalRows,
   putLocalEntity,
 } from '../local-store/entities';
-import { OperationQueue, type EntityType, type SyncOperation } from './queue';
+import { OperationQueue, type SyncOperation } from './queue';
 import { migrationApi } from '../utils/migrationApi';
 import { API_BASE } from '../utils/apiBase';
 import { setMigrationRevision } from '../utils/storage';
@@ -28,21 +30,20 @@ import { setMigrationRevision } from '../utils/storage';
 /** Kept small: each change is a round trip, and the database may be remote. */
 const BATCH_SIZE = 20;
 
+/**
+ * How many push rounds a user-requested full sync will make.
+ *
+ * One request only carries `BATCH_SIZE` operations, so a large queued import needs
+ * several rounds. The cap stops a server that keeps rejecting work from turning a
+ * button press into an endless loop.
+ */
+const MAX_PUSH_ROUNDS = 20;
+
 let isSyncing = false;
 /** The push currently in flight, so concurrent callers share one request. */
 let inflightSync: Promise<void> | null = null;
 
 const isBrowserOnline = (): boolean => (typeof navigator === 'undefined' ? true : navigator.onLine);
-
-const ENTITY_FOR_STORE: Record<string, EntityType> = {
-  products: 'PRODUCT',
-  groups: 'GROUP',
-  locations: 'LOCATION',
-  units: 'UNIT',
-  productUnits: 'PRODUCT_UNIT',
-  batches: 'BATCH',
-  openingStock: 'OPENING_STOCK',
-};
 
 export interface SyncSummary {
   synced: number;
@@ -52,6 +53,17 @@ export interface SyncSummary {
   /** True when the server could not be reached, so the UI can say "offline". */
   unreachable: boolean;
 }
+
+/** A full sync reports the same shape, so callers need only one code path. */
+export type FullSyncSummary = SyncSummary;
+
+const emptySummary = (): SyncSummary => ({
+  synced: 0,
+  conflicts: 0,
+  errors: 0,
+  remaining: 0,
+  unreachable: false,
+});
 
 if (typeof window !== 'undefined') {
   // Nothing may be lost while offline: keep retrying the outbox in the
@@ -254,20 +266,33 @@ export const SyncManager = {
    *
    * Rows with pending local intent (create/update/tombstone) and rows the outbox
    * still owns are skipped, so a refresh cannot resurrect a deletion or discard
-   * offline work.
+   * offline work. When the server says it is sending its complete state
+   * (`fullState`), local rows it no longer lists are removed — that is what makes
+   * a delete performed on another device disappear here too.
    */
-  async pullChanges(migrationId: string): Promise<boolean> {
+  async pullChanges(migrationId: string, options: { full?: boolean } = {}): Promise<boolean> {
     if (!isBrowserOnline()) return false;
     try {
       const db = await getDB();
       const migrationDoc = await db.get('migrations', migrationId);
       const currentRevision = migrationDoc?.revision || 0;
 
-      const changes = await migrationApi.getChanges(migrationId, currentRevision);
+      const changes = await migrationApi.getChanges(
+        migrationId,
+        options.full ? 0 : currentRevision
+      );
       if (!changes || typeof changes.toRevision !== 'number') return false;
-      if (changes.toRevision <= currentRevision) return true;
+      // "Nothing new since your revision" is only a reason to stop when a delta
+      // was asked for. A full pull was requested precisely because the local copy
+      // cannot be trusted to match the server, so its state is applied even when
+      // the revision looks unchanged.
+      if (!options.full && changes.toRevision <= currentRevision) return true;
 
       const state = changes.state ?? {};
+      // The server states whether this payload is everything it has. An
+      // "up to date" response carries empty lists and must never be read as
+      // "all your records were deleted".
+      const authoritative = changes.fullState === true;
       const pendingOps = await OperationQueue.getOperationsForMigration(migrationId);
       const pendingEntityIds = new Set(pendingOps.map((op) => op.entityId));
 
@@ -293,6 +318,11 @@ export const SyncManager = {
             syncState: 'SYNCED',
           });
         }
+
+        await pruneLocalRows(store, migrationId, new Set(serverEntities.map((row) => row.id)), {
+          pendingEntityIds,
+          authoritative,
+        });
       }
 
       await this.recordLocalRevision(migrationId, changes.toRevision);
@@ -301,5 +331,51 @@ export const SyncManager = {
       console.error('Failed to pull changes', error);
       return false;
     }
+  },
+
+  /**
+   * A user-requested full synchronisation ("Sync Latest Data").
+   *
+   * Pushes everything the outbox holds, then pulls the server's *complete* state
+   * so the local cache is rebuilt from the source of truth: updated rows
+   * overwrite local copies, new rows are inserted, and rows deleted on the server
+   * are pruned.
+   *
+   * The returned summary distinguishes "we are offline" from "the server refused
+   * something", because the two need different messages and different recovery.
+   */
+  async syncNow(migrationId: string): Promise<FullSyncSummary> {
+    if (!isBrowserOnline()) {
+      return { ...emptySummary(), unreachable: true };
+    }
+
+    const before = await OperationQueue.countPending(migrationId);
+
+    // Drain the outbox completely: a single batch is not enough when a large
+    // import is queued, and a full sync that leaves work behind is not a full sync.
+    let pushed = true;
+    for (let attempt = 0; attempt < MAX_PUSH_ROUNDS; attempt += 1) {
+      const round = await this.syncMigration(migrationId);
+      if (!round) {
+        pushed = false;
+        break;
+      }
+      if ((await OperationQueue.countPending(migrationId)) === 0) break;
+    }
+
+    // `full: true` asks for everything, not a delta, so nothing the server has
+    // can be missed and pruning is safe.
+    const pulled = await this.pullChanges(migrationId, { full: true });
+
+    const { conflicts, errors } = await OperationQueue.countIssues(migrationId);
+    const remaining = await OperationQueue.countPending(migrationId);
+
+    return {
+      synced: Math.max(0, before - remaining),
+      conflicts,
+      errors,
+      remaining,
+      unreachable: !pushed || !pulled,
+    };
   },
 };

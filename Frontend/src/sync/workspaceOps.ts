@@ -7,6 +7,7 @@
  */
 
 import { getDB } from '../local-store/db';
+import { newId } from '../utils/ids';
 import {
   STORE_FOR_ENTITY,
   deleteLocalEntity,
@@ -183,6 +184,52 @@ export async function saveStockEntry(
 }
 
 const isTombstoneRow = (row: any) => row?.syncState === 'DELETED_LOCALLY';
+
+/** The sort position a brand new line should take: after everything present. */
+export function nextStockPosition(entries: StockEntry[]): number {
+  return entries.reduce((max, entry) => Math.max(max, Number(entry.position) || 0), 0) + 1;
+}
+
+/**
+ * Copy an opening-stock line.
+ *
+ * A copy is a genuinely new line, not an edit of the original, so it gets:
+ *  - a new local id, so IndexedDB holds two rows;
+ *  - a new `lineKey`, so the derived business id — and therefore the PostgreSQL
+ *    row — is different too. Without this the copy would collide with the
+ *    original and silently replace it, which is exactly the bug that made the
+ *    Duplicate button look broken;
+ *  - a position just below the original, so it appears directly underneath.
+ *
+ * Every counted quantity is copied, because the point of duplicating a line is to
+ * get the same numbers again on a second line.
+ */
+export function duplicateStockEntry(source: StockEntry, entries: StockEntry[] = []): StockEntry {
+  const used = new Set(entries.map((entry) => (entry.lineKey ?? '').trim()).filter(Boolean));
+  const base = (source.lineKey ?? '').trim();
+
+  let lineKey = '';
+  for (let attempt = 1; lineKey === '' || used.has(lineKey); attempt += 1) {
+    // Short, stable, and visibly a copy: `~d1`, `~d2`, …
+    lineKey = base ? `~${base}.d${attempt}` : `~d${attempt}`;
+  }
+
+  const sourcePosition = Number(source.position) || 0;
+  // Insert directly below the source. If two lines already share that spot, append
+  // after the last line rather than landing on top of a neighbour.
+  const collides = entries.some(
+    (entry) => Math.abs((Number(entry.position) || 0) - (sourcePosition + 0.5)) < 1e-6
+  );
+  const position = collides ? nextStockPosition(entries) : sourcePosition + 0.5;
+
+  return {
+    ...source,
+    id: newId(),
+    lineKey,
+    position,
+    quantities: source.quantities.map((quantity) => ({ ...quantity })),
+  };
+}
 
 export const deleteStockEntry = (migrationId: string, entry: StockEntry) =>
   deleteEntity(migrationId, 'OPENING_STOCK', entry.id);

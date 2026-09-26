@@ -90,8 +90,9 @@ export const stockIdFor = (
   migrationId: string,
   productSku: string,
   batchNumber: string,
-  location: string
-) => stockId(migrationId, productSku, batchNumber, location);
+  location: string,
+  lineKey = ''
+) => stockId(migrationId, productSku, batchNumber, location, lineKey);
 
 export interface StockPayloadResult {
   entityId: string;
@@ -121,9 +122,12 @@ export function stockPayload(
   if (lines.length === 0) return null;
 
   const bid = batchId(migrationId, sku, batchNumber);
+  // A duplicated line carries its own key, so it addresses its own row instead of
+  // the row it was copied from.
+  const lineKey = clean(entry.lineKey) ?? '';
 
   return {
-    entityId: stockId(migrationId, sku, batchNumber, location),
+    entityId: stockId(migrationId, sku, batchNumber, location, lineKey),
     payload: {
       productId: productId(migrationId, sku),
       productSku: sku,
@@ -131,6 +135,8 @@ export function stockPayload(
       batchNumber,
       locationId: locationId(migrationId, location),
       locationName: location,
+      lineKey,
+      position: Number.isFinite(Number(entry.position)) ? Number(entry.position) : 0,
       // Preview only: the server recomputes and owns the base conversion.
       baseQuantity: calculateBaseQuantity(product, lines),
       unitBreakdown: lines.map((line) => ({

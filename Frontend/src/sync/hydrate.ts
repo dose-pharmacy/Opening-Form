@@ -17,11 +17,13 @@
 import { getDB } from '../local-store/db';
 import {
   ALL_STORES,
+  ENTITY_FOR_STORE,
   STORE_FOR_ENTITY,
   hasLocalWorkspace,
   isPending,
   isTombstone,
   loadWorkspace,
+  pruneLocalRows,
   putLocalEntity,
 } from '../local-store/entities';
 import { OperationQueue, type EntityType } from './queue';
@@ -34,16 +36,6 @@ import {
   setSetupStatus,
 } from '../utils/storage';
 import type { MigrationData } from '../utils/types';
-
-const ENTITY_FOR_STORE: Record<string, EntityType> = {
-  products: 'PRODUCT',
-  groups: 'GROUP',
-  locations: 'LOCATION',
-  units: 'UNIT',
-  productUnits: 'PRODUCT_UNIT',
-  batches: 'BATCH',
-  openingStock: 'OPENING_STOCK',
-};
 
 export interface ServerState {
   groups?: any[];
@@ -147,14 +139,23 @@ export async function hasLocalData(migrationId: string): Promise<boolean> {
 }
 
 /**
- * Write server rows into IndexedDB without touching local intent.
- * Returns the number of rows written.
+ * Write server rows into IndexedDB without touching local intent, and remove the
+ * rows the server no longer has.
+ *
+ * `authoritative` must only be true when `state` really is the complete server
+ * state for the migration; anything less and the absence of a row proves nothing.
  */
-export async function reconcileServerState(migrationId: string, state: ServerState): Promise<number> {
+export async function reconcileServerState(
+  migrationId: string,
+  state: ServerState,
+  options: { authoritative?: boolean } = {}
+): Promise<{ written: number; removed: string[] }> {
   const db = await getDB();
   const pendingOps = await OperationQueue.getOperationsForMigration(migrationId);
   const pendingEntityIds = new Set(pendingOps.map((op) => op.entityId));
+  const authoritative = options.authoritative ?? true;
   let written = 0;
+  const removed: string[] = [];
 
   for (const store of ALL_STORES) {
     const serverKey = store === 'openingStock' ? 'openingStocks' : store;
@@ -181,19 +182,36 @@ export async function reconcileServerState(migrationId: string, state: ServerSta
       });
       written += 1;
     }
+
+    // Rows the server has dropped are removed here, so a delete made on another
+    // device does not stay visible on this one.
+    removed.push(
+      ...(await pruneLocalRows(store, migrationId, new Set(rows.map((row) => row.id)), {
+        pendingEntityIds,
+        authoritative,
+      }))
+    );
   }
 
-  return written;
+  return { written, removed };
 }
 
-/** Fetch the full server state for a migration. */
-async function fetchServerState(migrationId: string): Promise<ServerState | null> {
+/**
+ * Fetch the complete server state for a migration.
+ *
+ * `sinceRevision: 0` is what makes the response authoritative, and the server
+ * says so explicitly with `fullState`; the flag is passed back so the caller only
+ * prunes local rows when it really is holding everything.
+ */
+async function fetchServerState(
+  migrationId: string
+): Promise<{ state: ServerState; authoritative: boolean } | null> {
   try {
     const changes = await migrationApi.getChanges(migrationId, 0);
     const state = (changes?.state ?? null) as ServerState | null;
     if (!state) return null;
     if (typeof changes.toRevision === 'number') setMigrationRevision(changes.toRevision);
-    return state;
+    return { state, authoritative: changes.fullState !== false };
   } catch (error) {
     console.warn('Could not fetch the existing migration from the server.', error);
     return null;
@@ -230,9 +248,9 @@ export async function hydrateWorkspace(
 
   // Step 4: nothing local, so the server is the only source of truth. If it
   // cannot be reached we must NOT show an empty, editable migration.
-  const state = await fetchServerState(migrationId);
+  const fetched = await fetchServerState(migrationId);
 
-  if (!state) {
+  if (!fetched) {
     const data = await loadWorkspace(migrationId);
     return {
       migrationId,
@@ -244,7 +262,7 @@ export async function hydrateWorkspace(
   }
 
   // Step 5: populate IndexedDB from the server response.
-  await reconcileServerState(migrationId, state);
+  await reconcileServerState(migrationId, fetched.state, { authoritative: fetched.authoritative });
 
   // Step 6: the UI reads from IndexedDB, never from the raw response.
   const data = await loadWorkspace(migrationId);

@@ -94,6 +94,30 @@ export class FakeSyncServer {
     };
   }
 
+  emptyState() {
+    return {
+      groups: [],
+      locations: [],
+      units: [],
+      products: [],
+      productUnits: [],
+      batches: [],
+      openingStocks: [],
+    };
+  }
+
+  /**
+   * Remove a row directly on the server, as another device's DELETE would.
+   * Lets a test prove the local cache drops records deleted in PostgreSQL.
+   */
+  removeOnServer(entityType: string, id: string): boolean {
+    const table = this.table(entityType);
+    if (!table || !table[id]) return false;
+    delete table[id];
+    this.revision += 1;
+    return true;
+  }
+
   /** One stored row per column set: the count is what "no duplicates" means. */
   count(entityType: string): number {
     return Object.keys(this.table(entityType) ?? {}).length;
@@ -131,11 +155,28 @@ export class FakeSyncServer {
       if (!this.exists) return { status: 404, body: { error: 'Migration not found' } };
       const since = Number(new URLSearchParams(request.path.split('?')[1] ?? '').get('sinceRevision')) || 0;
       if (this.revision <= since) {
-        return { status: 200, body: { migrationId: this.migrationId, fromRevision: since, toRevision: this.revision, changes: [] } };
+        // "You are up to date" — deliberately NOT authoritative, so a client that
+        // pruned on this response would wipe its own workspace.
+        return {
+          status: 200,
+          body: {
+            migrationId: this.migrationId,
+            fromRevision: since,
+            toRevision: this.revision,
+            fullState: false,
+            state: this.emptyState(),
+          },
+        };
       }
       return {
         status: 200,
-        body: { migrationId: this.migrationId, fromRevision: since, toRevision: this.revision, state: this.state() },
+        body: {
+          migrationId: this.migrationId,
+          fromRevision: since,
+          toRevision: this.revision,
+          fullState: true,
+          state: this.state(),
+        },
       };
     }
 
@@ -254,7 +295,7 @@ export class FakeSyncServer {
         if (['sku', 'name', 'genericName', 'brand', 'description', 'isActive', 'groupId', 'productId', 'unitId',
              'conversionToBase', 'isBaseUnit', 'sellPrice', 'purchasePrice', 'batchNumber', 'expiryDate',
              'manufacturingDate', 'receivedDate', 'supplierReference', 'baseQuantity', 'unitBreakdown',
-             'unitCost', 'locationId', 'batchId'].includes(key)) {
+             'unitCost', 'locationId', 'batchId', 'lineKey', 'position'].includes(key)) {
           stored[key] = value;
         }
       }

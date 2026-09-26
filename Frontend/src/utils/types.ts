@@ -83,6 +83,16 @@ export interface StockEntry {
   batchNumber: string;
   location: string;
   quantities: StockQuantity[];
+  /**
+   * Identity of this line within its (batch, location) pair.
+   *
+   * Empty for an ordinary line. "Duplicate row" gives the copy its own key, which
+   * is what lets two identical lines exist instead of the copy silently
+   * overwriting the original.
+   */
+  lineKey?: string;
+  /** Sort position in the form, so a duplicate can sit below its original. */
+  position?: number;
 }
 
 export interface MigrationData {
