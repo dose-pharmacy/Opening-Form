@@ -102,10 +102,15 @@ router.delete('/:id', async (req, res) => {
     try {
         const { migrationId, id } = (req.params as any);
 
-        const stockCount = await prisma.openingStock.count({ where: { batchId: id } });
-        if (stockCount > 0) return res.status(409).json({ error: 'Cannot delete batch because it is referenced by stock.' });
-
-        await prisma.batch.delete({ where: { id, migrationId } });
+        await prisma.$transaction(async (tx) => {
+            const stockCount = await tx.openingStock.count({ where: { batchId: id } });
+            if (stockCount > 0) {
+                const err: any = new Error('Cannot delete batch because it is referenced by stock.');
+                err.statusCode = 409;
+                throw err;
+            }
+            await tx.batch.delete({ where: { id, migrationId } });
+        });
 
         await prisma.migration.update({
             where: { id: migrationId },
@@ -113,7 +118,8 @@ router.delete('/:id', async (req, res) => {
         });
 
         res.status(204).send();
-    } catch (error) {
+    } catch (error: any) {
+        if (error.statusCode === 409) return res.status(409).json({ error: error.message });
         res.status(500).json({ error: 'Failed to delete batch' });
     }
 });
