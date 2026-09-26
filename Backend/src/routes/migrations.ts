@@ -21,6 +21,50 @@ router.post('/', async (req, res) => {
   }
 });
 
+// GET /migrations — list every migration with its row counts.
+// The workspace uses this to reuse the migration that already holds data
+// instead of creating a blank one on every new browser/device.
+router.get('/', async (_req, res) => {
+  try {
+    const migrations = await prisma.migration.findMany({
+      orderBy: { lastActivityAt: 'desc' },
+      include: {
+        _count: {
+          select: {
+            products: true,
+            batches: true,
+            locations: true,
+            groups: true,
+            units: true,
+            openingStocks: true,
+          },
+        },
+      },
+    });
+
+    res.json(
+      migrations.map((migration) => ({
+        id: migration.id,
+        name: migration.name,
+        status: migration.status,
+        revision: migration.revision,
+        createdAt: migration.createdAt,
+        lastActivityAt: migration.lastActivityAt,
+        counts: {
+          products: migration._count.products,
+          batches: migration._count.batches,
+          locations: migration._count.locations,
+          groups: migration._count.groups,
+          units: migration._count.units,
+          openingStockRecords: migration._count.openingStocks,
+        },
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to list migrations' });
+  }
+});
+
 // GET /migrations/:id
 router.get('/:id', async (req, res) => {
   try {
@@ -201,19 +245,21 @@ router.get('/:id/export', async (req, res) => {
       source: {
         migrationName: migration.name
       },
-      groups: groups.map(g => g.name),
-      locations: locations.map(l => ({ name: l.name, description: l.description })),
-      units: units.map(u => ({ name: u.name, symbol: u.symbol, description: u.description })),
+      productGroups: groups.map((g) => ({ name: g.name })),
+      locations: locations.map((l) => ({ name: l.name })),
+      suppliers: [],
+      units: units.map((u) => ({ name: u.name, symbol: u.symbol })),
       products: products.map(p => {
          const pUnits = productUnits.filter(pu => pu.productId === p.id).map(pu => {
            const u = units.find(unit => unit.id === pu.unitId);
            return {
-             name: u?.name || 'Unknown',
-             symbol: u?.symbol || '',
-             conversionToBase: pu.conversionToBase,
+             unit: u?.name || 'Unknown',
              isBaseUnit: pu.isBaseUnit,
-             sellingPrice: pu.sellPrice,
-             purchasePrice: pu.purchasePrice
+             contains: null,
+             containedUnit: null,
+             conversionFactor: pu.conversionToBase,
+             purchasePrice: pu.purchasePrice ?? 0,
+             sellPrice: pu.sellPrice ?? 0
            };
          });
          const groupName = groups.find(g => g.id === p.groupId)?.name || null;
@@ -222,19 +268,25 @@ router.get('/:id/export', async (req, res) => {
            name: p.name,
            genericName: p.genericName,
            brand: p.brand,
-           group: groupName,
+           productGroup: groupName ?? '',
            description: p.description,
+           minStock: 0,
+           reorderPoint: 0,
+           isNarcotic: false,
            units: pUnits
          };
       }),
       batches: batches.map(b => {
          const p = products.find(prod => prod.id === b.productId);
+         const dateOnly = (value: Date | null) =>
+           value ? value.toISOString().slice(0, 10) : null;
          return {
-           productSku: p?.sku,
+           productSku: p?.sku ?? '',
            batchNumber: b.batchNumber,
-           expiryDate: b.expiryDate,
-           manufacturingDate: b.manufacturingDate,
-           receivedDate: b.receivedDate,
+           expiryDate: dateOnly(b.expiryDate),
+           manufacturingDate: dateOnly(b.manufacturingDate),
+           receivedDate: dateOnly(b.receivedDate),
+           supplier: null,
            supplierReference: b.supplierReference
          };
       }),
@@ -250,15 +302,15 @@ router.get('/:id/export', async (req, res) => {
              if (Array.isArray(breakdown)) {
                  quantities = breakdown.map(q => {
                      const u = units.find(unit => unit.id === q.unitId);
-                     return { unit: u?.name || q.unitId, quantity: q.quantity };
+                     return { unit: u?.name || q.unitId, quantity: q.quantity, unitCost: os.unitCost ?? 0 };
                  });
              }
          } catch (e) {}
 
          return {
-           productSku: p?.sku,
-           batchNumber: b?.batchNumber,
-           location: l?.name,
+           productSku: p?.sku ?? '',
+           batchNumber: b?.batchNumber ?? '',
+           location: l?.name ?? '',
            baseQuantity: os.baseQuantity,
            unitCost: os.unitCost,
            quantities

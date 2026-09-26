@@ -34,7 +34,8 @@ import { ReviewDialog } from '../components/ReviewDialog';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { SyncStatusIndicator } from '../components/SyncStatusIndicator';
 import { ConflictDialog } from '../components/ConflictDialog';
-import { syncDraft } from '../sync/pushDraft';
+import { mirrorServerEntities, syncDraft } from '../sync/pushDraft';
+import { fetchServerDraft, mergeDraftData } from '../sync/hydrate';
 import { SyncManager } from '../sync/syncManager';
 
 /** The workspace reuses one server migration across reloads. */
@@ -86,6 +87,96 @@ const addNamed = <T extends { name: string }>(list: T[], name: string, factory: 
 
 type SaveState = 'saved' | 'saving' | 'error';
 
+const readStoredMigrationId = (): string | null => {
+  try {
+    return localStorage.getItem(MIGRATION_ID_KEY);
+  } catch {
+    return null;
+  }
+};
+
+const storeMigrationId = (id: string): void => {
+  try {
+    localStorage.setItem(MIGRATION_ID_KEY, id);
+  } catch {
+    /* ignore */
+  }
+};
+
+const clearStoredMigrationId = (): void => {
+  try {
+    localStorage.removeItem(MIGRATION_ID_KEY);
+  } catch {
+    /* ignore */
+  }
+};
+
+/** How much saved inventory a migration holds. */
+const migrationScore = (counts: Record<string, number> = {}): number =>
+  (counts.products ?? 0) +
+  (counts.batches ?? 0) +
+  (counts.openingStockRecords ?? 0) +
+  (counts.openingStocks ?? 0);
+
+/**
+ * Pick the migration this workspace should use.
+ *
+ * The tool is one shared workspace, not one browser: when the stored id is gone
+ * — or points at an empty migration because a fresh device created one — the
+ * data already in the database must win, otherwise the table starts blank even
+ * though the inventory is saved.
+ */
+async function resolveMigrationId(stored: string | null): Promise<string | null> {
+  let candidate = stored;
+
+  if (candidate) {
+    try {
+      await migrationApi.getMigration(candidate);
+    } catch (error: any) {
+      if (error?.status === 404) {
+        // The server explicitly says it is gone; a new id is needed.
+        clearStoredMigrationId();
+        candidate = null;
+      } else {
+        // Service unreachable: keep the identity and work offline.
+        return candidate;
+      }
+    }
+  }
+
+  try {
+    const list = await migrationApi.listMigrations();
+    if (candidate) {
+      const own = list.find((migration) => migration.id === candidate);
+      if (own && migrationScore(own.counts) > 0) return candidate;
+    }
+    const richest = list
+      .filter((migration) => migrationScore(migration.counts) > 0)
+      .sort((a, b) => {
+        const diff = migrationScore(b.counts) - migrationScore(a.counts);
+        if (diff !== 0) return diff;
+        return new Date(b.lastActivityAt ?? 0).getTime() - new Date(a.lastActivityAt ?? 0).getTime();
+      })[0];
+    if (richest) {
+      storeMigrationId(richest.id);
+      return richest.id;
+    }
+  } catch {
+    // Backend without the list endpoint: fall back to the stored id below.
+  }
+
+  if (candidate) return candidate;
+
+  try {
+    const created = await migrationApi.createMigration('Opening Inventory Migration');
+    storeMigrationId(created.id);
+    return created.id;
+  } catch (error) {
+    console.warn('Could not reach the migration service yet.', error);
+    return null;
+  }
+}
+
 const Home: React.FC = () => {
   const [data, setData] = useState<MigrationData>(() => {
     const { data: saved } = loadDraft();
@@ -107,60 +198,18 @@ const Home: React.FC = () => {
   const [resetFiltersToken, setResetFiltersToken] = useState(0);
   
   // ── Server migration identity ──────────────────────────────────────
-  const [migrationId, setMigrationId] = useState<string | null>(() => {
-    try {
-      return localStorage.getItem(MIGRATION_ID_KEY);
-    } catch {
-      return null;
-    }
-  });
+  const [migrationId, setMigrationId] = useState<string | null>(readStoredMigrationId);
   const [syncToken, setSyncToken] = useState(0);
 
-  // Reuse the stored migration; only create one when the server no longer has it.
+  // Resolve the migration that actually holds the saved inventory, so a new
+  // browser/device shows the data already in the database instead of a blank
+  // table. Retried when the connection returns.
   useEffect(() => {
     let cancelled = false;
 
     const ensureMigration = async () => {
-      const stored = (() => {
-        try {
-          return localStorage.getItem(MIGRATION_ID_KEY);
-        } catch {
-          return null;
-        }
-      })();
-
-      if (stored) {
-        try {
-          await migrationApi.getMigration(stored);
-          if (!cancelled) setMigrationId(stored);
-          return;
-        } catch (error: any) {
-          // The stored migration is only abandoned when the server explicitly
-          // says it is gone. An outage must not orphan the draft's identity.
-          if (error?.status !== 404) {
-            if (!cancelled) setMigrationId(stored);
-            return;
-          }
-          try {
-            localStorage.removeItem(MIGRATION_ID_KEY);
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-
-      try {
-        const created = await migrationApi.createMigration('Opening Inventory Migration');
-        try {
-          localStorage.setItem(MIGRATION_ID_KEY, created.id);
-        } catch {
-          /* ignore */
-        }
-        if (!cancelled) setMigrationId(created.id);
-      } catch (error) {
-        // Offline: keep working on the draft, retry when the connection returns.
-        console.warn('Could not reach the migration service yet.', error);
-      }
+      const resolved = await resolveMigrationId(readStoredMigrationId());
+      if (!cancelled && resolved) setMigrationId(resolved);
     };
 
     ensureMigration();
@@ -178,6 +227,40 @@ const Home: React.FC = () => {
   // operations, queued locally, and pushed (retried until it lands).
   const dataRef = useRef(data);
   dataRef.current = data;
+
+  // ── Load the saved inventory from the server ───────────────────────
+  // A device that has never opened this workspace has no local draft, but the
+  // inventory is already in the database. Pull it once per migration, merge it
+  // with any local (possibly unsynced) work, and show all of it.
+  const hydratedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!migrationId || hydratedFor.current === migrationId) return;
+    hydratedFor.current = migrationId;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const serverDraft = await fetchServerDraft(migrationId, dataRef.current);
+        if (cancelled || !serverDraft) return;
+        // Mark server-only rows as synced before the draft change triggers a push.
+        await mirrorServerEntities(
+          migrationId,
+          serverDraft.draft,
+          serverDraft.serverOnlyIds,
+          serverDraft.versions
+        );
+        if (cancelled) return;
+        setData((prev) => mergeDraftData(serverDraft.draft, prev));
+        setSyncToken((token) => token + 1);
+      } catch (error) {
+        console.warn('Could not load the saved inventory from the server.', error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [migrationId]);
 
   useEffect(() => {
     if (!migrationId) return;

@@ -321,3 +321,43 @@ export async function syncDraft(
 
   return { queued, skipped, pruned };
 }
+
+/**
+ * Record server rows that do not exist locally as already-synced.
+ *
+ * Hydration loads the server inventory into the draft. Without this, the very
+ * next `syncDraft` would diff those rows against an empty local mirror and push
+ * the whole database back to the server on every new device. Rows with queued
+ * work are never touched, so unsynced local edits are still pushed.
+ */
+export async function mirrorServerEntities(
+  migrationId: string,
+  serverDraft: MigrationData,
+  serverOnlyIds: Set<string>,
+  versions: Map<string, number>
+): Promise<void> {
+  if (!migrationId || serverOnlyIds.size === 0) return;
+
+  const db = await getDB();
+  const ops = (await db.getAllFromIndex('operations', 'by-migration', migrationId)) as SyncOperation[];
+  const busy = new Set(ops.map((op) => op.entityId));
+
+  const planned = planMigrationOperations(migrationId, serverDraft);
+  for (const plan of planned) {
+    if (!serverOnlyIds.has(plan.entityId) || busy.has(plan.entityId)) continue;
+
+    const existing = await getLocalEntity(plan.entityType, plan.entityId);
+    const row: LocalEntityRow = {
+      ...(existing ?? {}),
+      ...(plan.payload as Record<string, unknown>),
+      id: plan.entityId,
+      migrationId,
+      version: versions.get(plan.entityId) ?? existing?.version ?? 1,
+      synced: true,
+      serverId: existing?.serverId,
+      lastSyncedPayload: JSON.stringify(plan.payload),
+      managedByDraft: true,
+    };
+    await putLocalEntity(plan.entityType, row);
+  }
+}

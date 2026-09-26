@@ -16,6 +16,11 @@ export interface MigrationSummaryResponse {
   counts: Record<string, number>;
 }
 
+export interface MigrationListItem extends MigrationSummaryResponse {
+  lastActivityAt?: string;
+  createdAt?: string;
+}
+
 export const migrationApi = {
   createMigration: async (name: string): Promise<{ id: string; revision: number }> => {
     const res = await fetch(`${API_BASE}/migrations`, {
@@ -42,6 +47,20 @@ export const migrationApi = {
       throw error;
     }
     return res.json();
+  },
+
+  /**
+   * Every migration with its row counts, newest activity first.
+   *
+   * The workspace is not tied to one browser: this is how a fresh device finds
+   * the migration that already holds the saved inventory instead of creating an
+   * empty one and appearing blank.
+   */
+  listMigrations: async (): Promise<MigrationListItem[]> => {
+    const res = await fetch(`${API_BASE}/migrations`);
+    if (!res.ok) throw new Error('Failed to list migrations');
+    const body = await res.json();
+    return Array.isArray(body) ? body : [];
   },
 
   getSummary: async (id: string): Promise<MigrationSummaryResponse> => {

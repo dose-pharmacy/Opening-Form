@@ -212,7 +212,7 @@ export function normalizeMigration(raw: unknown): MigrationData {
 
   return {
     schemaVersion: SCHEMA_VERSION,
-    productGroups: toNamedRefs(source.productGroups),
+    productGroups: toNamedRefs(source.productGroups ?? source.groups),
     locations: toNamedRefs(source.locations),
     suppliers: toNamedRefs(source.suppliers),
     units: unitCatalogue,
