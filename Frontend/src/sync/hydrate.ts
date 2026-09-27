@@ -186,7 +186,7 @@ export async function reconcileServerState(
     // Rows the server has dropped are removed here, so a delete made on another
     // device does not stay visible on this one.
     removed.push(
-      ...(await pruneLocalRows(store, migrationId, new Set(rows.map((row) => row.id)), {
+      ...(await pruneLocalRows(store, migrationId, rows, {
         pendingEntityIds,
         authoritative,
       }))

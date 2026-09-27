@@ -167,10 +167,28 @@ export async function hasLocalWorkspace(migrationId: string): Promise<boolean> {
  *
  * Returns the ids that were removed.
  */
+/**
+ * Drop local rows the server no longer has.
+ *
+ * PostgreSQL is the source of truth, so a row that is missing from an
+ * *authoritative* server snapshot was deleted on the server and must not linger
+ * in IndexedDB. This is what stops one device from showing a record another
+ * device removed.
+ *
+ * The rule is deliberately narrow, because the alternative — deleting anything
+ * the payload does not mention — is how a partial or failed response wipes a
+ * user's unsynced work. A row is only removed when all of these hold:
+ *  - the snapshot was the complete server state (`authoritative`);
+ *  - the row carries no pending local intent and the outbox does not own it;
+ *  - the row is not a tombstone (a queued delete owns it);
+ *  - the row has been confirmed by the server at least once (`SYNCED`).
+ *
+ * Returns the ids that were removed.
+ */
 export async function pruneLocalRows(
   store: EntityStore,
   migrationId: string,
-  serverIds: Set<string>,
+  serverEntities: any[],
   options: { pendingEntityIds?: Set<string>; authoritative?: boolean } = {}
 ): Promise<string[]> {
   if (options.authoritative === false) return [];
@@ -179,6 +197,15 @@ export async function pruneLocalRows(
   const rows = await getRawRows(store, migrationId);
   const removed: string[] = [];
 
+  // Build a Set of server IDs and (for openingStock) business keys
+  const serverIds = new Set(serverEntities.map((r) => r.id));
+  const serverBusinessKeys = new Set<string>();
+  if (store === "openingStock") {
+    for (const s of serverEntities) {
+      serverBusinessKeys.add(`${s.productId}::${s.batchId}::${s.locationId}::${s.lineKey ?? ""}`);
+    }
+  }
+
   for (const row of rows) {
     if (serverIds.has(row.id)) continue;
     if (isPending(row)) continue;
@@ -186,25 +213,21 @@ export async function pruneLocalRows(
     if (pendingEntityIds.has(row.id)) continue;
     // Only a row the server has confirmed can be *deleted* by the server's
     // silence. A row that never reached it is this device's own unsynced work.
-    if (row.syncState !== 'SYNCED') continue;
+    if (row.syncState !== "SYNCED") continue;
 
-    await deleteLocalEntity(ENTITY_FOR_STORE[store], row.id);    removed.push(row.id);
+    // Fallback for openingStock: match by business key (productId+batchId+locationId+lineKey)
+    // in case the local row still has a UUID while the server uses a different ID.
+    if (store === "openingStock") {
+      const localBizKey = `${row.productId}::${row.batchId}::${row.locationId}::${row.lineKey ?? ""}`;
+      if (serverBusinessKeys.has(localBizKey)) continue; // Business key still exists on server, don't prune
+    }
+
+    await deleteLocalEntity(ENTITY_FOR_STORE[store], row.id);
+    removed.push(row.id);
   }
 
   return removed;
 }
-
-/**
- * Mark a row as fully mirrored by the server.
- *
- * When the server adopted the row under a different id the local row is moved
- * across, so later operations address the id the server actually uses.
- *
- * A confirmation only counts for the operation that asked for it. If the row has
- * since been given new intent â€” most importantly a DELETE tombstone that arrived
- * while this operation was still in flight â€” the row is left alone, so an older
- * CREATE can never resurrect something the user removed.
- */
 export async function markEntitySynced(
   migrationId: string,
   entityType: EntityType,

@@ -319,7 +319,7 @@ export const SyncManager = {
           });
         }
 
-        await pruneLocalRows(store, migrationId, new Set(serverEntities.map((row) => row.id)), {
+        await pruneLocalRows(store, migrationId, serverEntities, {
           pendingEntityIds,
           authoritative,
         });
